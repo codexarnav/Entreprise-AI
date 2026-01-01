@@ -88,13 +88,68 @@ Data: {model_input_json}""",
     )
     formatted_prompt = prompt.format(model_input_json=state['model_input_json'])
     raw_output = llm.invoke(formatted_prompt).content
-    result = json.loads(raw_output)
+    
+    # Parse JSON response with error handling
+    try:
+        # Extract content if it's a string
+        if isinstance(raw_output, str):
+            content = raw_output.strip()
+            
+            # Check if response is empty
+            if not content:
+                raise ValueError("Empty response from LLM")
+            
+            # Try to extract JSON from markdown code blocks if present
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0].strip()
+            elif "```" in content:
+                content = content.split("```")[1].split("```")[0].strip()
+            
+            # Parse JSON
+            result = json.loads(content)
+        else:
+            # If not a string, try to use it directly
+            result = raw_output if isinstance(raw_output, dict) else {}
+        
+        # Validate required fields and provide defaults
+        pwin_score = result.get("pwin_score", 0.5)
+        strengths = result.get("strengths", [])
+        weaknesses = result.get("weaknesses", [])
+        recommendations = result.get("recommendations", [])
+        
+        # Ensure pwin_score is a float between 0 and 1
+        if not isinstance(pwin_score, (int, float)):
+            pwin_score = 0.5
+        pwin_score = max(0.0, min(1.0, float(pwin_score)))
+        
+        # Ensure lists are actually lists
+        if not isinstance(strengths, list):
+            strengths = [str(strengths)] if strengths else []
+        if not isinstance(weaknesses, list):
+            weaknesses = [str(weaknesses)] if weaknesses else []
+        if not isinstance(recommendations, list):
+            recommendations = [str(recommendations)] if recommendations else []
+        
+    except (json.JSONDecodeError, ValueError, KeyError) as e:
+        print(f"Error parsing LLM response: {e}")
+        print(f"Raw output: {raw_output[:200]}...")  # Print first 200 chars for debugging
+        # Return default values on error
+        result = {
+            "pwin_score": 0.5,
+            "strengths": [],
+            "weaknesses": ["Unable to parse LLM response"],
+            "recommendations": ["Review the RFP manually"]
+        }
+        pwin_score = 0.5
+        strengths = []
+        weaknesses = result["weaknesses"]
+        recommendations = result["recommendations"]
 
     return state | {
-        "pwin_score": result["pwin_score"],
-        "strength": result["strengths"],
-        "weekness": result["weaknesses"],
-        "recommendation": result["recommendations"]
+        "pwin_score": pwin_score,
+        "strength": strengths,
+        "weekness": weaknesses,
+        "recommendation": recommendations
     }
 
 

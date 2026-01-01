@@ -238,6 +238,22 @@ class TechnicalAgent:
         match = state["best_match"]
         score = state["best_score"]
     
+        # Handle case where no match was found (shouldn't happen, but safety check)
+        if match is None:
+            # If no match found but we're here, treat as gap
+            gap = TechnicalGap(
+                requirement_id=req.id,
+                requirement_description=req.description,
+                missing_parameters=list(req.parameters.keys()),
+                best_partial_match=None,
+                gap_severity="Critical",
+                innovation_needed="No matching products found in catalog"
+            )
+            return {
+                "technical_gaps": [gap],
+                "requirement_index": state["requirement_index"] + 1
+            }
+    
         # 🔁 Safely parse parameters back to dict
         raw_params = match["metadata"].get("parameters", "{}")
         if isinstance(raw_params, str):
@@ -360,6 +376,9 @@ class TechnicalAgent:
 
 
     def _route_after_evaluation(self, state: TechnicalAgentState):
+        # Only route to "match" if we have a valid match and score meets threshold
+        if state["best_match"] is None:
+            return "gap"
         return "match" if state["best_score"] >= state["similarity_threshold"] else "gap"
 
 
