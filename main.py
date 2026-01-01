@@ -374,7 +374,8 @@ def process_rfp(file_path: Optional[str] = None, pdf_path: Optional[str] = None)
         }
         
         print(f"✓ Pricing Complete")
-        print(f"  Total Price: ${pricing_result.get('total_price', 0):,.2f}")
+        total_price = pricing_result.get('total_price') or 0
+        print(f"  Total Price: ${total_price:,.2f}")
         
     except Exception as e:
         print(f"✗ Error in Dynamic Pricing Agent: {e}")

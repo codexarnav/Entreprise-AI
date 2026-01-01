@@ -530,9 +530,10 @@ if __name__ == "__main__":
     print("Dynamic Pricing Agent (The Profit Engine) - Results")
     print("=" * 70)
     
-    print(f"\nClient: {result['client_relationship']}")
-    print(f"Goal: {result['goal']}")
-    print(f"PWin: {result['pwin_score']}%")
+    print(f"\nClient: {result.get('client_relationship', 'N/A')}")
+    print(f"Goal: {result.get('goal', 'N/A')}")
+    pwin_score = result.get('pwin_score') or 0.0
+    print(f"PWin: {pwin_score}%")
     print(f"Using LLM: {'Yes' if result.get('use_llm') else 'No (Rule-based)'}")
     
     # Check for critical errors
@@ -546,13 +547,16 @@ if __name__ == "__main__":
     
     # Display cost breakdown
     print(f"\n--- Step 1: Costing with Risk Buffers ---")
-    print(f"Total Base Cost: ${result['total_base_cost']:,.2f}")
-    print(f"Total Risk Buffer: ${result['total_risk_buffer']:,.2f}")
-    print(f"Total Innovation Cost (NRE): ${result['total_innovation_cost']:,.2f}")
+    total_base_cost = result.get('total_base_cost') or 0.0
+    total_risk_buffer = result.get('total_risk_buffer') or 0.0
+    total_innovation_cost = result.get('total_innovation_cost') or 0.0
+    print(f"Total Base Cost: ${total_base_cost:,.2f}")
+    print(f"Total Risk Buffer: ${total_risk_buffer:,.2f}")
+    print(f"Total Innovation Cost (NRE): ${total_innovation_cost:,.2f}")
     
     # Display strategic reasoning
     print(f"\n--- Step 2: Strategic Margin Adjustment ---")
-    strategic_adj = result.get("strategic_margin_adjustment", 0.0)
+    strategic_adj = result.get("strategic_margin_adjustment") or 0.0
     print(f"Strategic Margin Adjustment: {strategic_adj*100:+.2f}%")
     if result.get("llm_reasoning"):
         print(f"Reasoning: {result['llm_reasoning']}")
@@ -569,7 +573,8 @@ if __name__ == "__main__":
                   f"${item['unit_price']:>13,.2f} {item['quantity']:>9} ${item['total_price']:>13,.2f}")
         
         print("-" * 90)
-        print(f"{'TOTAL':<6} {'':<12} {'':<25} {'':<15} {'':<10} ${result['total_price']:>13,.2f}")
+        total_price = result.get('total_price') or 0.0
+        print(f"{'TOTAL':<6} {'':<12} {'':<25} {'':<15} {'':<10} ${total_price:>13,.2f}")
     
     # Display risk notes
     if result.get("risk_notes"):
