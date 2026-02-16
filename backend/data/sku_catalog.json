@@ -1,0 +1,179 @@
+[
+  {
+    "sku_id": "CBL-1100-XLPE-ARM",
+    "product_name": "1.1kV XLPE Armored Cable",
+    "description": "Medium voltage power cable with XLPE insulation and steel wire armor, suitable for industrial installations",
+    "parameters": {
+      "voltage": "1.1kV",
+      "insulation": "XLPE",
+      "armor": "SWA",
+      "conductor": "Copper",
+      "cores": "3-Core",
+      "temperature_rating": "90C"
+    },
+    "spec_sheet_url": "https://example.com/specs/cbl1100.pdf",
+    "category": "Cable"
+  },
+  {
+    "sku_id": "CBL-300-ALU-PVC",
+    "product_name": "300V Aluminum PVC Cable",
+    "description": "Low voltage flexible PVC insulated cable for general electrical wiring and residential applications",
+    "parameters": {
+      "voltage": "300V",
+      "insulation": "PVC",
+      "conductor": "Aluminum",
+      "cores": "2-Core",
+      "temperature_rating": "70C"
+    },
+    "spec_sheet_url": "https://example.com/specs/cbl300.pdf",
+    "category": "Cable"
+  },
+  {
+    "sku_id": "CBL-FRLSH-1KV-4C",
+    "product_name": "1kV FR-LSH Fire Retardant Cable",
+    "description": "Fire retardant low smoke halogen cable for indoor industrial wiring and safety-critical applications",
+    "parameters": {
+      "voltage": "1kV",
+      "insulation": "FR-LSH",
+      "conductor": "Copper",
+      "armor": "None",
+      "cores": "4-Core",
+      "fire_rating": "FR-LSH",
+      "temperature_rating": "90C"
+    },
+    "spec_sheet_url": "https://example.com/specs/frlsh.pdf",
+    "category": "Cable"
+  },
+  {
+    "sku_id": "CBL-33KV-HT-XLPE",
+    "product_name": "33kV High Tension XLPE Power Cable",
+    "description": "High tension power cable designed for substations and transmission lines",
+    "parameters": {
+      "voltage": "33kV",
+      "insulation": "XLPE",
+      "armor": "SWA",
+      "conductor": "Copper",
+      "cores": "Single Core",
+      "temperature_rating": "90C"
+    },
+    "spec_sheet_url": "https://example.com/specs/33kv.pdf",
+    "category": "Cable"
+  },
+  {
+    "sku_id": "CBL-CONTROL-1.1KV-12C",
+    "product_name": "1.1kV Multi-Core Control Cable",
+    "description": "Control cable used in automation and industrial panels for signal transmission",
+    "parameters": {
+      "voltage": "1.1kV",
+      "insulation": "PVC",
+      "armor": "None",
+      "conductor": "Copper",
+      "cores": "12-Core",
+      "temperature_rating": "70C"
+    },
+    "spec_sheet_url": "https://example.com/specs/control.pdf",
+    "category": "Control Cable"
+  },
+  {
+    "sku_id": "CBL-SOLAR-DC-1500V",
+    "product_name": "1500V Solar DC Cable",
+    "description": "UV-resistant, weatherproof cable for solar PV installations and renewable energy systems",
+    "parameters": {
+      "voltage": "1500V DC",
+      "insulation": "XLPE",
+      "conductor": "Copper",
+      "cores": "Single Core",
+      "temperature_rating": "120C",
+      "uv_resistant": "Yes"
+    },
+    "spec_sheet_url": "https://example.com/specs/solar.pdf",
+    "category": "Solar Cable"
+  },
+  {
+    "sku_id": "CBL-ARMORED-INSTR-600V",
+    "product_name": "600V Armored Instrumentation Cable",
+    "description": "Shielded armored instrumentation cable for industrial sensors and measurement systems",
+    "parameters": {
+      "voltage": "600V",
+      "insulation": "PVC",
+      "armor": "SWA",
+      "conductor": "Copper",
+      "shielding": "Aluminum Foil",
+      "cores": "4-Pair",
+      "temperature_rating": "90C"
+    },
+    "spec_sheet_url": "https://example.com/specs/instr-armored.pdf",
+    "category": "Instrumentation"
+  },
+  {
+    "sku_id": "CBL-ETH-CAT6-IND",
+    "product_name": "Industrial CAT6 Ethernet Cable",
+    "description": "High-speed rugged Ethernet cable for industrial networking and data transmission",
+    "parameters": {
+      "type": "CAT6",
+      "speed": "1Gbps",
+      "shielding": "STP",
+      "temperature_rating": "90C",
+      "cores": "4-Pair"
+    },
+    "spec_sheet_url": "https://example.com/specs/cat6.pdf",
+    "category": "Networking"
+  },
+  {
+    "sku_id": "CBL-OFC-SM-12C",
+    "product_name": "12 Core Single-Mode Fiber Optic Cable",
+    "description": "Low-loss optical fiber cable for telecom backbone and long-distance data transmission",
+    "parameters": {
+      "fiber_type": "Single Mode",
+      "cores": "12",
+      "jacket": "HDPE",
+      "application": "Outdoor Underground",
+      "wavelength": "1310nm/1550nm"
+    },
+    "spec_sheet_url": "https://example.com/specs/ofc12.pdf",
+    "category": "Fiber Optic"
+  },
+  {
+    "sku_id": "CBL-HVAC-400HZ",
+    "product_name": "400Hz Aircraft Grade Cable",
+    "description": "Low-weight cable designed for aircraft electrical systems and aerospace applications",
+    "parameters": {
+      "frequency": "400Hz",
+      "insulation": "Silicone",
+      "conductor": "Tinned Copper",
+      "temperature_rating": "200C",
+      "weight": "Lightweight"
+    },
+    "spec_sheet_url": "https://example.com/specs/aircraft.pdf",
+    "category": "Aerospace Cable"
+  },
+  {
+    "sku_id": "SWT-PNL-MAIN-400A",
+    "product_name": "400A Main Distribution Panel",
+    "description": "Main distribution panel for industrial power distribution with circuit breakers",
+    "parameters": {
+      "current_rating": "400A",
+      "voltage": "415V",
+      "phases": "3-Phase",
+      "enclosure": "IP54",
+      "circuit_breakers": "MCB"
+    },
+    "spec_sheet_url": "https://example.com/specs/panel400a.pdf",
+    "category": "Switchgear"
+  },
+  {
+    "sku_id": "TRF-DIST-1000KVA",
+    "product_name": "1000kVA Distribution Transformer",
+    "description": "Oil-cooled distribution transformer for power distribution networks",
+    "parameters": {
+      "capacity": "1000kVA",
+      "primary_voltage": "11kV",
+      "secondary_voltage": "415V",
+      "cooling": "ONAN",
+      "type": "Distribution"
+    },
+    "spec_sheet_url": "https://example.com/specs/transformer1mva.pdf",
+    "category": "Transformer"
+  }
+]
+
