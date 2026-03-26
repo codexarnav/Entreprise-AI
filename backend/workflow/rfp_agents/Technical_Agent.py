@@ -9,12 +9,8 @@ from datetime import datetime
 import operator
 
 from langgraph.graph import StateGraph, END
-
-
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_community.embeddings import HuggingFaceEmbeddings
-
-# Vector DB
 from langchain_community.vectorstores import Chroma
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
@@ -115,9 +111,6 @@ class TechnicalAgent:
         self.workflow = self._build_graph()
     
 
-    # ========================================================================
-    # GRAPH DEFINITION
-    # ========================================================================
 
     def _build_graph(self) -> StateGraph:
         workflow = StateGraph(TechnicalAgentState)

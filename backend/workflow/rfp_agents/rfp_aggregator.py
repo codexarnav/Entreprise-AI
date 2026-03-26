@@ -8,6 +8,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
+
 class RfpAggregatorInput(BaseModel):
     text_path:str
     pdf_path:Optional[str]
@@ -70,10 +72,10 @@ def rfp_aggregator_ner(state:RfpAggregatorState)->RfpAggregatorState:
         answer=ner(question=question,context=rfp_text)
         rfp_details[key]=answer['answer']
 
-    # Try to coerce deadline to a clean string; avoid failing on bad parses
+    
     raw_deadline = rfp_details.get('deadline') or ""
     try:
-        # If it looks like a number, keep as normalized string
+        
         deadline_value = str(float(raw_deadline))
     except Exception:
         deadline_value = raw_deadline.strip()

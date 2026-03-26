@@ -4,9 +4,6 @@ from .database import Base
 from datetime import datetime
 
 
-# ============================================================================
-# MASTER PROCESSING TABLE
-# ============================================================================
 
 class RFPProcessing(Base):
     """Master table tracking the entire RFP processing pipeline"""
@@ -27,11 +24,6 @@ class RFPProcessing(Base):
     technical_analysis = relationship("TechnicalAnalysis", back_populates="processing", uselist=False, cascade="all, delete-orphan")
     pricing_data = relationship("PricingData", back_populates="processing", uselist=False, cascade="all, delete-orphan")
     proposal = relationship("ProposalData", back_populates="processing", uselist=False, cascade="all, delete-orphan")
-
-
-# ============================================================================
-# AGENT OUTPUT TABLES
-# ============================================================================
 
 class RFPData(Base):
     """RFP Aggregator output"""

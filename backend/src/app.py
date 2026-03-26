@@ -10,21 +10,21 @@ import traceback
 import logging
 
 # Import all agents
-from workflow.agents.rfp_aggregator import (
+from workflow.rfp_agents.rfp_aggregator import (
     RfpAggregatorInput, RfpAggregatorOutput, RfpAggregatorState,
     document_loader, chunks, rfp_aggregator_ner
 )
-from workflow.agents.risk_and_compilance import (
+from workflow.rfp_agents.risk_and_compilance import (
     RiskAndComplianceState, read_text_file, split_text, 
     ner_legal_bert, generate_report, access_risk, generate_risk_brief
 )
-from workflow.agents.pwin import (
+from workflow.rfp_agents.pwin import (
     PwinState, RfpAggregator, RiskandCompilance, CRM,
     prepare_data, PwinAgentLLM
 )
-from workflow.agents.Technical_Agent import TechnicalAgent, RFPRequirement
-from workflow.agents.dynamic_pricing_agent import create_pricing_agent, AgentState as PricingAgentState
-from workflow.agents.proposal_weaver_agent import create_proposal_weaver_agent, AgentState as ProposalAgentState
+from workflow.rfp_agents.Technical_Agent import TechnicalAgent, RFPRequirement
+from workflow.rfp_agents.dynamic_pricing_agent import create_pricing_agent, AgentState as PricingAgentState
+from workflow.rfp_agents.proposal_weaver_agent import create_proposal_weaver_agent, AgentState as ProposalAgentState
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
