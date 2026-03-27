@@ -130,26 +130,14 @@ def scoring_engine(state: ProcurementState) -> ProcurementState:
     state["scored_vendors"] = scored
     return state
 
-
 def select_top_vendors(state: ProcurementState) -> ProcurementState:
     """Select top 2-3 vendors for negotiation"""
     top_count = min(3, max(1, len(state["scored_vendors"])))
     state["top_vendors"] = state["scored_vendors"][:top_count]
     return state
 
-
 def negotiation_simulation(state: ProcurementState, user_action: Dict[str, Any]) -> ProcurementState:
-    """
-    User-driven negotiation simulation.
     
-    user_action format:
-    {
-        "vendor_id": "v123",
-        "negotiation_type": "price" | "delivery" | "terms",
-        "target_value": 5000.0,
-        "negotiation_intent": "reduce_cost" | "accelerate_delivery" | "improve_terms"
-    }
-    """
     vendor_id = user_action.get("vendor_id")
     intent = user_action.get("negotiation_intent", "reduce_cost")
     target_value = user_action.get("target_value")
@@ -275,7 +263,6 @@ def rescore_after_negotiation(state: ProcurementState) -> ProcurementState:
     
     return state
 
-
 def decision_engine(state: ProcurementState) -> ProcurementState:
     """Make final vendor selection"""
     if not state["top_vendors"]:
@@ -316,7 +303,6 @@ def decision_engine(state: ProcurementState) -> ProcurementState:
     
     return state
 
-
 def purchase_order_generation(state: ProcurementState) -> ProcurementState:
     """Generate PO from final decision"""
     if state["decision"]["status"] != "approved":
@@ -347,7 +333,6 @@ def purchase_order_generation(state: ProcurementState) -> ProcurementState:
     state["decision"]["purchase_order"] = purchase_order
     
     return state
-
 
 def build_procurement_graph():
     """
