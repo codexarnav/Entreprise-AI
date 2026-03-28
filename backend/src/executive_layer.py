@@ -422,6 +422,7 @@ class ToolSelector:
             "technical_agent": self._run_technical_agent,
             "dynamic_pricing": self._run_dynamic_pricing,
             "proposal_weaver": self._run_proposal_weaver,
+            "run_full_rfp_pipeline": self.run_full_rfp_pipeline,
             "vendor_evaluation": self._run_vendor_evaluation,
             "vendor_negotiation": self._run_vendor_negotiation,
             "document_verification": self._run_document_verification,
@@ -579,9 +580,103 @@ class ToolSelector:
             }
         except Exception as e:
             return {"status": "error", "error": str(e)}
-    
-    # ========== PROCUREMENT TOOLS ==========
-    
+        
+    def run_full_rfp_pipeline(self, task: Task) -> Dict:
+        """Execute complete RFP processing pipeline sequentially"""
+        try:
+            logger.info("🚀 Running full RFP pipeline...\n")
+            pipeline_results = {}
+            
+            # STEP 1: RFP Aggregation
+            logger.info("▶️  [Step 1/5] RFP Aggregation")
+            rfp_result = self._run_rfp_aggregator(task)
+            if rfp_result.get("status") != "success":
+                return {"status": "error", "error": "RFP Aggregation failed", "step": "rfp_aggregator"}
+            
+            pipeline_results["rfp_aggregator"] = rfp_result["data"]
+            self.state.results["rfp_aggregator"] = rfp_result["data"]
+            
+            rfp_data = rfp_result["data"]
+            scope_list = rfp_data.get("scope", [])
+            rfp_text = " ".join(scope_list) if isinstance(scope_list, list) else str(scope_list)
+            self.state.results["rfp_text"] = rfp_text
+            self.state.results["technical_requirements"] = rfp_data.get("technical_requirements", [])
+            self.state.results["rfp_title"] = rfp_data.get("rfp_title", "")
+            self.state.results["deadline"] = rfp_data.get("deadline", "")
+            logger.info(f"✓ RFP loaded: {rfp_data.get('rfp_title', 'Untitled')}\n")
+            
+            logger.info("▶️  [Step 2/5] Risk & Compliance Assessment")
+            risk_result = self._run_risk_compliance(task)
+            if risk_result.get("status") == "error":
+                logger.warning(f"⚠️  Risk compliance failed: {risk_result.get('error')}")
+                return {"status": "error", "error": "Risk assessment failed", "step": "risk_compliance"}
+            
+            if risk_result.get("status") == "skipped":
+                logger.info(f"⊘ Risk compliance skipped: {risk_result.get('reason')}\n")
+                pipeline_results["risk_compliance"] = {"risk_score": 0.0, "risk_brief": "", "legal_risks": []}
+            else:
+                pipeline_results["risk_compliance"] = risk_result["data"]
+                self.state.results["risk_compliance"] = risk_result["data"]
+                logger.info(f"✓ Risk score: {risk_result['data'].get('risk_score', 'N/A')}\n")
+            
+            # STEP 3: Technical Requirements Matching
+            logger.info("▶️  [Step 3/5] Technical Requirements Matching")
+            tech_result = self._run_technical_agent(task)
+            if tech_result.get("status") == "error":
+                logger.warning(f"⚠️  Technical agent failed: {tech_result.get('error')}")
+                return {"status": "error", "error": "Technical matching failed", "step": "technical_agent"}
+            
+            if tech_result.get("status") == "skipped":
+                logger.info(f"⊘ Technical matching skipped: {tech_result.get('reason')}\n")
+                pipeline_results["technical_agent"] = {"matched_skus": [], "technical_gaps": [], "match_confidence": 0.0}
+            else:
+                pipeline_results["technical_agent"] = tech_result["data"]
+                self.state.results["technical_agent"] = tech_result["data"]
+                logger.info(f"✓ SKU matching complete\n")
+            
+            # STEP 4: Dynamic Pricing Calculation
+            logger.info("▶️  [Step 4/5] Dynamic Pricing Calculation")
+            pricing_result = self._run_dynamic_pricing(task)
+            if pricing_result.get("status") == "error":
+                logger.warning(f"⚠️  Pricing agent failed: {pricing_result.get('error')}")
+                return {"status": "error", "error": "Pricing calculation failed", "step": "dynamic_pricing"}
+            
+            pipeline_results["dynamic_pricing"] = pricing_result["data"]
+            self.state.results["dynamic_pricing"] = pricing_result["data"]
+            logger.info(f"✓ Price calculated: ${pricing_result['data'].get('total_price', 0)}\n")
+            
+            logger.info("▶️  [Step 5/5] Proposal Generation")
+            proposal_result = self._run_proposal_weaver(task)
+            if proposal_result.get("status") == "error":
+                logger.warning(f"⚠️  Proposal weaver failed: {proposal_result.get('error')}")
+                return {"status": "error", "error": "Proposal generation failed", "step": "proposal_weaver"}
+            
+            pipeline_results["proposal_weaver"] = proposal_result["data"]
+            self.state.results["proposal_weaver"] = proposal_result["data"]
+            logger.info(f"✓ Proposal generated with sections: {proposal_result['data'].get('sections', [])}\n")
+            
+            # Compile final output
+            logger.info("✓ RFP Pipeline completed successfully\n")
+            return {
+                "status": "success",
+                "data": {
+                    "pipeline_status": "completed",
+                    "proposal_status": "ready",
+                    "stages_completed": list(pipeline_results.keys()),
+                    "summary": {
+                        "rfp_title": self.state.results.get("rfp_title"),
+                        "deadline": self.state.results.get("deadline"),
+                        "risk_level": pipeline_results.get("risk_compliance", {}).get("risk_brief", ""),
+                        "total_price": pipeline_results.get("dynamic_pricing", {}).get("total_price", 0),
+                        "proposal_sections": pipeline_results.get("proposal_weaver", {}).get("sections", [])
+                    },
+                    "detailed_results": pipeline_results
+                }
+            }
+        except Exception as e:
+            logger.error(f"❌ RFP Pipeline failed: {str(e)}")
+            return {"status": "error", "error": str(e), "step": "unknown"}
+            
     def _run_vendor_evaluation(self, task: Task) -> Dict:
         """Execute Vendor Evaluation"""
         try:
@@ -614,7 +709,6 @@ class ToolSelector:
         except Exception as e:
             return {"status": "error", "error": str(e)}
     
-    # ========== ONBOARDING TOOLS ==========
     
     def _run_document_verification(self, task: Task) -> Dict:
         """Verify vendor documents"""
@@ -688,7 +782,6 @@ class ToolSelector:
         except Exception as e:
             return {"status": "error", "error": str(e)}
     
-    # ========== COMPETITOR TOOLS ==========
     
     def _run_competitor_analysis(self, task: Task) -> Dict:
         """Execute Competitor Analysis"""
@@ -802,6 +895,8 @@ def orchestrate(input_data: PerceptionInput) -> OrchestrationOutput:
         
         # STEP 3: TASK DECOMPOSITION
         tasks = task_decomposition(goal)
+        if not tasks:
+            logger.warning("⚠️  No tasks decomposed. Returning empty result.")
         
         # STEP 4: INITIALIZE EXECUTION STATE
         state = ExecutionState(
@@ -842,7 +937,7 @@ def orchestrate(input_data: PerceptionInput) -> OrchestrationOutput:
 if __name__ == "__main__":
     example_input = PerceptionInput(
         workflow_type="rfp",
-        rfp_pdf_path="/path/to/rfp.pdf",
+        rfp_pdf_path="",
         user_context="Process RFP for customer X"
     )
     
