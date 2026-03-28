@@ -81,6 +81,14 @@ class PromptInput(BaseModel):
     email_config: Optional[Dict[str, Any]] = None  # {folder: "inbox", service: "gmail", etc}
     # Optional additional context
     context: Optional[Dict[str, Any]] = None  # {vendor_name, requirement, client, etc}
+    # Session identity
+    session_id: Optional[str] = None
+    user_id:    Optional[str] = None
+    # Prior session context loaded from MongoDB by the background runner.
+    # Injected before orchestrate() is called — orchestrate() is sync so it
+    # cannot await Mongo directly.  Shape mirrors session.context[-1]:
+    # { last_workflow, last_intent, results: {...distilled...}, history: [...] }
+    prior_context: Optional[Dict[str, Any]] = None
 
 
 class PerceptionInput(BaseModel):
@@ -131,6 +139,23 @@ class Task(BaseModel):
     error: Optional[str] = None
 
 
+class HILRequest(BaseModel):
+    """Defines what the human must supply before execution can resume."""
+    task_id: str
+    task_name: str
+    required_fields: Dict[str, str]   # field_name -> human-readable description
+    message: str
+    hil_type: Literal["data_collection", "approval", "review"] = "data_collection"
+
+
+class HILStatus(BaseModel):
+    """Tracks whether execution is paused awaiting human input."""
+    required: bool = False
+    request: Optional[HILRequest] = None
+    paused_at_task_index: int = 0
+    resolved: bool = False
+
+
 class ExecutionState(BaseModel):
     """Track execution state"""
     workflow_id: str
@@ -142,10 +167,11 @@ class ExecutionState(BaseModel):
     results: Dict[str, Any] = {}
     completed_tasks: List[str] = []
     failed_tasks: Dict[str, str] = {}
-    status: Literal["initialized", "running", "completed", "failed"] = "initialized"
+    status: Literal["initialized", "running", "completed", "failed", "awaiting_hil"] = "initialized"
     start_time: Optional[datetime] = None
     end_time: Optional[datetime] = None
     execution_log: List[str] = []
+    hil_status: Optional[HILStatus] = None
 
 
 class OrchestrationOutput(BaseModel):
@@ -158,6 +184,7 @@ class OrchestrationOutput(BaseModel):
     success_metrics: Dict[str, Any] = {}
     errors: Dict[str, str] = {}
     total_execution_time: float = 0.0
+    hil_status: Optional[HILStatus] = None
 
 
 def get_llm():
@@ -239,6 +266,23 @@ CRITICAL EXTRACTION EXAMPLES:
 - Prompt: "scrape https://tender.gov.in for rfps" → tender_url should be "https://tender.gov.in"
 - Prompt: "process /uploads/acme_rfp.pdf" → rfp_pdf_path should be "/uploads/acme_rfp.pdf"
 - Prompt: "onboard vendor TechCorp" → vendor_details.name should be "TechCorp"
+
+PRIOR SESSION (when [CONTEXT] contains "prior_session" key):
+This means the user is following up on a previous turn in the same chat session.
+Resolve "this", "that", "it", "the first one", "that RFP", "that vendor", etc. by
+looking inside prior_session.results:
+  - prior_session.results.email_rfps[0].attachments[0]  → rfp_pdf_path
+  - prior_session.results.rfp.title / buyer             → context for rfp intent  
+  - prior_session.results.recommended_vendor.name       → vendor_details.name
+Always populate the resolved entity even if NOT re-stated in the current prompt.
+
+FOLLOW-UP EXAMPLES:
+- Prior turn scanned emails, found rfp_cloud.pdf. Prompt: "create a proposal for this"
+  → intent="rfp", action="process_rfp", rfp_pdf_path="<prior attachment>"
+- Prior procurement selected TechCorp. Prompt: "run competitor analysis for this"
+  → intent="competitor", action="competitor_analysis", vendor_details.name="TechCorp"
+- Prior email scan. Prompt: "who are the competitors in this space"
+  → intent="competitor", action="competitor_analysis"
 
 Return ONLY valid JSON. No explanations, no markdown code blocks.
 """
@@ -527,21 +571,48 @@ class ToolSelector:
     # ========== INPUT HANDLER TOOLS ==========
     
     def _run_email_handler(self, task: Task) -> Dict:
-        """Execute email scanning for RFPs"""
+        """Execute email scanning for RFPs.
+
+        Credential resolution order (highest → lowest priority):
+        1. task.required_inputs       – per-call override
+        2. state.results["email_config"] – injected at login time by orchestrate()
+        3. Environment variables        – GMAIL_ID / APP_PASSWORD (last resort fallback)
+        """
         try:
             logger.info("📧 Scanning emails for RFPs...")
-            emails = process_unread_emails()
-            
+
+            # Resolve credentials from session context or fall back to env
+            email_config = self.state.results.get("email_config") or {}
+            email_id = (
+                task.required_inputs.get("email_id") or
+                email_config.get("gmail_id")  # None -> process_unread_emails falls back to env
+            )
+            app_password = (
+                task.required_inputs.get("app_password") or
+                email_config.get("app_password")
+            )
+
+            # Audit trail
+            auth_source = "session" if email_config.get("gmail_id") else "environment"
+            logger.info(f"🔐 EMAIL AUTH: credentials sourced from [{auth_source}]")
+            logger.info(
+                f"   [AUDIT] email_scan | user={email_id or 'env-default'} | "
+                f"auth_source={auth_source} | timestamp={datetime.now().isoformat()}"
+            )
+
+            emails = process_unread_emails(email_id=email_id, app_password=app_password)
             rfp_emails = [e for e in emails if e.get('category') == 'RFP']
             logger.info(f"✓ Found {len(rfp_emails)} RFP emails from {len(emails)} total")
-            
+
             return {
                 "status": "success",
                 "data": {
                     "emails_processed": len(emails),
                     "rfp_emails_found": len(rfp_emails),
                     "emails": rfp_emails,
-                    "source": "gmail"
+                    "source": "gmail",
+                    "auth_source": auth_source,
+                    "scanned_at": datetime.now().isoformat()
                 }
             }
         except Exception as e:
@@ -1590,41 +1661,102 @@ def execution_loop(
     tasks: List[Task],
     input_data: PerceptionInput
 ) -> ExecutionState:
-   
+
     logger.info("🔄 EXECUTION LOOP: Starting task execution...\n")
-    
+
     state.status = "running"
     state.start_time = datetime.now()
-    
+
     tool_selector = ToolSelector(input_data, state)
-    
+
     for task in tasks:
         if not _check_dependencies(task, state):
             logger.warning(f"⏭️  Skipping {task.task_name} (dependency not met)")
             continue
-        
+
+        # ── HIL GATE 1: Vendor KYC — collect identity details before proceeding ──
+        if task.tool_name == "kyc_verification":
+            aadhar = (
+                task.required_inputs.get("aadhar_number") or
+                state.results.get("vendor_aadhar")
+            )
+            pan = (
+                task.required_inputs.get("pan_number") or
+                state.results.get("vendor_pan")
+            )
+            if not aadhar or not pan:
+                logger.info("⏸️  HIL REQUIRED: Vendor KYC identity details not available")
+                state.hil_status = HILStatus(
+                    required=True,
+                    request=HILRequest(
+                        task_id=task.id,
+                        task_name=task.task_name,
+                        required_fields={
+                            "aadhar_number": "12-digit Aadhar number of the vendor",
+                            "pan_number": "10-character PAN number (e.g. ABCDE1234F)",
+                            "document_path": "File path to identity document for OCR (optional)"
+                        },
+                        message=(
+                            "Vendor KYC requires identity details before proceeding. "
+                            "Please provide the vendor's Aadhar and PAN information."
+                        ),
+                        hil_type="data_collection"
+                    ),
+                    paused_at_task_index=state.current_step
+                )
+                state.status = "awaiting_hil"
+                state.end_time = datetime.now()
+                logger.info(f"⏸️  Execution paused at task [{task.id}] — awaiting HIL input\n")
+                return state
+
+        # ── HIL GATE 2: High-risk vendor — executive escalation approval ──────────
+        if task.tool_name == "vendor_risk":
+            risk_data = state.results.get("vendor_risk", {})
+            if risk_data.get("requires_escalation"):
+                logger.info("⏸️  HIL REQUIRED: High-risk vendor flagged — executive approval needed")
+                state.hil_status = HILStatus(
+                    required=True,
+                    request=HILRequest(
+                        task_id=task.id,
+                        task_name="High-Risk Vendor Escalation",
+                        required_fields={
+                            "approval": "approve or reject (required)",
+                            "notes": "Reviewer notes (optional)"
+                        },
+                        message=(
+                            "This vendor has been flagged as HIGH RISK. "
+                            "Executive approval is required before proceeding."
+                        ),
+                        hil_type="approval"
+                    ),
+                    paused_at_task_index=state.current_step
+                )
+                state.status = "awaiting_hil"
+                state.end_time = datetime.now()
+                logger.info(f"⏸️  Execution paused at task [{task.id}] — awaiting HIL approval\n")
+                return state
+
         task.status = "running"
         logger.info(f"▶️  [{state.current_step + 1}/{len(tasks)}] {task.task_name}")
-        
+
         try:
             result = tool_selector.select_and_execute(task)
-            
+
             task.status = "completed"
             task.result = result
             state.results[task.id] = result.get("data", {})
             state.completed_tasks.append(task.id)
-            
+
         except Exception as e:
             logger.error(f"❌ Task failed: {task.task_name}")
             task.status = "failed"
             task.error = str(e)
             state.failed_tasks[task.id] = str(e)
-        
+
         state.current_step += 1
-    
+
     state.end_time = datetime.now()
     state.status = "completed"
-    
     logger.info(f"\n✓ Execution complete: {len(state.completed_tasks)}/{len(tasks)} successful\n")
     return state
 
@@ -1638,15 +1770,23 @@ def _check_dependencies(task: Task, state: ExecutionState) -> bool:
 
 
 def compile_output(state: ExecutionState) -> OrchestrationOutput:
-    
+
     logger.info("📦 FINAL OUTPUT: Compiling results...")
-    
+
     execution_time = 0.0
     if state.start_time and state.end_time:
         execution_time = (state.end_time - state.start_time).total_seconds()
-    
+
+    # Status priority: HIL pause > failures > success
+    if state.hil_status and state.hil_status.required:
+        overall_status = "awaiting_hil"
+    elif state.failed_tasks:
+        overall_status = "partial_success"
+    else:
+        overall_status = "success"
+
     output = OrchestrationOutput(
-        status="success" if not state.failed_tasks else "partial_success",
+        status=overall_status,
         workflow_id=state.workflow_id,
         workflow_type=state.workflow_type,
         tasks_executed=state.completed_tasks,
@@ -1658,11 +1798,47 @@ def compile_output(state: ExecutionState) -> OrchestrationOutput:
             "completed_tasks": len(state.completed_tasks),
             "failed_tasks": len(state.failed_tasks),
             "success_rate": len(state.completed_tasks) / len(state.tasks) if state.tasks else 0
-        }
+        },
+        hil_status=state.hil_status
     )
-    
+
     logger.info(f"✓ Output compiled: {output.status}\n")
     return output
+
+
+def distil_results_for_ctx(results: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Strip bulky fields from execution results — keep only entity-resolution
+    facts for the next session turn (subjects, attachment paths, RFP metadata,
+    recommended vendor).  Called by the async background runner before writing
+    to MongoDB.  Public so it can be imported without touching private state.
+    """
+    out: Dict[str, Any] = {}
+    for val in results.values():
+        if not isinstance(val, dict):
+            continue
+        if val.get("emails"):
+            out["email_rfps"] = [
+                {"subject": e.get("subject"), "attachments": e.get("attachments", [])}
+                for e in val["emails"][:5]
+            ]
+        if val.get("tenders"):
+            out["tenders"] = [
+                {"title": t.get("title"), "url": t.get("url")}
+                for t in val["tenders"][:3]
+            ]
+        if val.get("rfp_title"):
+            out["rfp"] = {
+                "title":    val["rfp_title"],
+                "buyer":    val.get("buyer", ""),
+                "deadline": val.get("deadline", ""),
+            }
+        if val.get("recommended"):
+            out["recommended_vendor"] = val["recommended"]
+        if val.get("top_vendors"):
+            out["top_vendors"] = val["top_vendors"]
+    return out
+
 
 def orchestrate(prompt_input: PromptInput) -> OrchestrationOutput:
     """
@@ -1676,6 +1852,20 @@ def orchestrate(prompt_input: PromptInput) -> OrchestrationOutput:
     logger.info(f"{'='*80}\n")
     
     try:
+        # ── Mongo-backed prior context ──────────────────────────────────────────
+        # prior_context is pre-fetched from MongoDB by the async background
+        # runner before calling orchestrate() (orchestrate is sync, cannot await).
+        _prior_ctx: Dict[str, Any] = prompt_input.prior_context or {}
+        if _prior_ctx:
+            if prompt_input.context is None:
+                prompt_input.context = {}
+            prompt_input.context["prior_session"] = _prior_ctx
+            logger.info(
+                f"🔗 Prior context injected from Mongo: "
+                f"workflow={_prior_ctx.get('last_workflow')} "
+                f"turns={len(_prior_ctx.get('history', [])) + 1}"
+            )
+
         # STEP 1: PERCEPTION - Parse natural language prompt with context
         perception = perception_layer(prompt_input)
         
@@ -1695,25 +1885,43 @@ def orchestrate(prompt_input: PromptInput) -> OrchestrationOutput:
             goal=goal,
             tasks=tasks
         )
-        
+
+        # Inject per-session credentials into state so tools can access at runtime
+        # (email_config is populated by the login endpoint before orchestrate() is called)
+        if prompt_input.email_config:
+            state.results["email_config"] = prompt_input.email_config
+            logger.info("🔐 Email credentials loaded into execution state (source: login session)")
+
+        # Pre-seed state with prior turn's distilled results so tools find the
+        # right entities (e.g. rfp_pdf_path from an email scan in the last turn).
+        if _prior_ctx.get("results"):
+            seeded = {k: v for k, v in _prior_ctx["results"].items() if k != "email_config"}
+            if seeded:
+                state.results.update(seeded)
+                logger.info(f"🌱 State pre-seeded from prior turn: {list(seeded.keys())}")
+
         # STEP 5: EXECUTION LOOP
-        # Create PerceptionInput preserving PromptInput context
+        # Build backward-compat PerceptionInput, preserving all relevant context
         compat_input = PerceptionInput(
             workflow_type=perception.workflow,
             rfp_pdf_path=perception.entities.get("rfp_pdf_path"),
             tender_url=perception.entities.get("tender_url"),
             email_text=perception.entities.get("email_config"),
+            vendor_details=perception.entities.get("vendor_details"),  # was missing before
             user_context=json.dumps(perception.entities)
         )
         state = execution_loop(state, tasks, compat_input)
         
         # STEP 6: COMPILE OUTPUT
         output = compile_output(state)
-        
+
+        # ── Session persistence is now handled by the async background runner ───
+        # (it reads from / writes to MongoDB around this orchestrate() call)
+
         logger.info(f"{'='*80}")
         logger.info(f"✅ ORCHESTRATION COMPLETE: {output.status}")
         logger.info(f"{'='*80}\n")
-        
+
         return output
     
     except Exception as e:

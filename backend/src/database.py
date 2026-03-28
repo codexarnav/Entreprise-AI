@@ -1,12 +1,28 @@
-import sqlalchemy as db
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.ext.declarative import declarative_base
+import os
+import logging
+from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 
-SQLDATABASE_URL="sqlite:///./test.db"
+logger = logging.getLogger(__name__)
 
-engine=create_engine(SQLDATABASE_URL,connect_args={"check_same_thread": False})
+MONGO_URI = os.getenv("MONGO_URI") 
+DB_NAME   = os.getenv("MONGODB_DB", "enterprise_ai")
 
-SessionLocal=sessionmaker(autocommit=False,autoflush=False,bind=engine)
+_client: AsyncIOMotorClient = None
 
-Base=declarative_base()
+
+async def connect_db() -> None:
+    global _client
+    _client = AsyncIOMotorClient(MONGO_URI)
+    await _client.admin.command("ping")
+    logger.info(f"✓ MongoDB connected → {DB_NAME}")
+
+
+async def close_db() -> None:
+    global _client
+    if _client:
+        _client.close()
+        logger.info("MongoDB connection closed")
+
+
+def get_db() -> AsyncIOMotorDatabase:
+    return _client[DB_NAME]

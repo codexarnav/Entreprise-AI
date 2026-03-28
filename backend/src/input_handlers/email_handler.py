@@ -19,17 +19,28 @@ APP_PASSWORD = os.getenv("APP_PASSWORD")
 # Save directory: backend/data/emails/
 save_directory = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "data", "emails")
 
-def connect_to_gmail():
-    """Connects to Gmail via IMAP and returns the connected object."""
-    if not GMAIL_ID or not APP_PASSWORD:
-        raise ValueError("GMAIL_ID and APP_PASSWORD must be set in the .env file. Please ensure environment variables are loaded.")
-    
+def connect_to_gmail(email_id: str = None, app_password: str = None):
+    """Connects to Gmail via IMAP and returns the connected object.
+
+    Args:
+        email_id:     Gmail address. Falls back to GMAIL_ID env var if not provided.
+        app_password: Gmail App Password. Falls back to APP_PASSWORD env var if not provided.
+    """
+    resolved_id = email_id or GMAIL_ID
+    resolved_pw = app_password or APP_PASSWORD
+
+    if not resolved_id or not resolved_pw:
+        raise ValueError(
+            "Email credentials not available. Either pass email_id/app_password directly "
+            "(injected at login) or set GMAIL_ID and APP_PASSWORD environment variables."
+        )
+
     try:
         mail = imaplib.IMAP4_SSL("imap.gmail.com")
-        mail.login(GMAIL_ID, APP_PASSWORD)
+        mail.login(resolved_id, resolved_pw)
         return mail
     except Exception as e:
-        print(f"Failed to connect to Gmail: {e}")
+        print(f"Failed to connect to Gmail ({resolved_id}): {e}")
         return None
 
 def fetch_unread_emails(mail, limit=10):
@@ -138,13 +149,16 @@ def save_email(email_data):
         
     return filepath
 
-def process_unread_emails():
+def process_unread_emails(email_id: str = None, app_password: str = None):
     """
-    Final function to fetch, parse, classify, filter, and save unread emails.
-    Returns a list of structured data for relevant emails.
-    Unwanted emails are discarded.
+    Fetch, parse, classify, filter, and save unread emails.
+    Returns a list of structured data for relevant emails. Unwanted emails are discarded.
+
+    Args:
+        email_id:     Gmail address (falls back to GMAIL_ID env var).
+        app_password: Gmail App Password (falls back to APP_PASSWORD env var).
     """
-    mail = connect_to_gmail()
+    mail = connect_to_gmail(email_id=email_id, app_password=app_password)
     if not mail:
         return []
 
