@@ -2,25 +2,13 @@
 
 import { useState, useEffect } from "react"
 import { useSearchParams, useRouter } from "next/navigation"
-import { motion, AnimatePresence } from "framer-motion"
+import { motion } from "framer-motion"
 import { Cpu, Building2, Users, ArrowRight, Eye, EyeOff } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { FloatingRobot } from "@/components/floating-robot"
 import Link from "next/link"
-
-const industries = [
-  "Defense & Aerospace",
-  "Manufacturing",
-  "Finance & Banking",
-  "Healthcare & MedTech",
-  "Infrastructure",
-  "Energy & Utilities",
-  "Technology",
-  "Government",
-]
 
 export default function AuthPage() {
   const searchParams = useSearchParams()
@@ -28,14 +16,11 @@ export default function AuthPage() {
   const initialType = searchParams.get("type") as "oem" | "client" | null
   
   const [portalType, setPortalType] = useState<"oem" | "client">(initialType || "client")
-  const [isSignUp, setIsSignUp] = useState(false)
   const [showPassword, setShowPassword] = useState(false)
   const [isTyping, setIsTyping] = useState(false)
   const [formData, setFormData] = useState({
     email: "",
     password: "",
-    company: "",
-    industry: "",
   })
 
   const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -88,7 +73,7 @@ export default function AuthPage() {
           ))}
         </div>
 
-        <div className="relative z-10 flex flex-col justify-center px-16">
+        <div className="relative z-10 flex flex-col justify-center px-16 h-full">
           <motion.div
             initial={{ opacity: 0, x: -30 }}
             animate={{ opacity: 1, x: 0 }}
@@ -146,7 +131,7 @@ export default function AuthPage() {
       </div>
 
       {/* Right Panel - Auth Form */}
-      <div className="flex-1 flex flex-col justify-center px-8 lg:px-16">
+      <div className="flex-1 flex flex-col justify-center px-8 lg:px-16 overflow-y-auto py-8">
         <div className="max-w-md mx-auto w-full">
           {/* Portal Type Toggle */}
           <div className="flex gap-2 mb-8 p-1 glass-card rounded-xl">
@@ -181,58 +166,14 @@ export default function AuthPage() {
           >
             <div>
               <h2 className="text-2xl font-bold">
-                {isSignUp ? "Create Account" : "Welcome Back"}
+                Welcome Back
               </h2>
               <p className="text-muted-foreground mt-1">
-                {isSignUp 
-                  ? "Set up your procurement intelligence account"
-                  : "Sign in to your procurement dashboard"}
+                Sign in to your procurement dashboard
               </p>
             </div>
 
             <form onSubmit={handleSubmit} className="space-y-4">
-              <AnimatePresence mode="wait">
-                {isSignUp && (
-                  <motion.div
-                    initial={{ opacity: 0, height: 0 }}
-                    animate={{ opacity: 1, height: "auto" }}
-                    exit={{ opacity: 0, height: 0 }}
-                    className="space-y-4"
-                  >
-                    <div className="space-y-2">
-                      <Label htmlFor="company">Company Name</Label>
-                      <Input
-                        id="company"
-                        name="company"
-                        placeholder="Enter company name"
-                        value={formData.company}
-                        onChange={handleInputChange}
-                        className="glass-button"
-                      />
-                    </div>
-
-                    <div className="space-y-2">
-                      <Label htmlFor="industry">Industry / Specialization</Label>
-                      <Select
-                        value={formData.industry}
-                        onValueChange={(value) => setFormData(prev => ({ ...prev, industry: value }))}
-                      >
-                        <SelectTrigger className="glass-button">
-                          <SelectValue placeholder="Select industry" />
-                        </SelectTrigger>
-                        <SelectContent>
-                          {industries.map((industry) => (
-                            <SelectItem key={industry} value={industry}>
-                              {industry}
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                    </div>
-                  </motion.div>
-                )}
-              </AnimatePresence>
-
               <div className="space-y-2">
                 <Label htmlFor="email">Email</Label>
                 <Input
@@ -243,6 +184,7 @@ export default function AuthPage() {
                   value={formData.email}
                   onChange={handleInputChange}
                   className="glass-button"
+                  required
                 />
               </div>
 
@@ -257,6 +199,7 @@ export default function AuthPage() {
                     value={formData.password}
                     onChange={handleInputChange}
                     className="glass-button pr-10"
+                    required
                   />
                   <button
                     type="button"
@@ -270,30 +213,23 @@ export default function AuthPage() {
 
               <Button 
                 type="submit" 
-                className={`w-full gap-2 ${portalType === "oem" ? "bg-neon-red hover:bg-neon-red/90" : ""}`}
+                className={`w-full gap-2 mt-4 ${portalType === "oem" ? "bg-neon-red hover:bg-neon-red/90" : ""}`}
                 size="lg"
               >
-                {isSignUp ? "Create Account" : "Sign In"}
+                Sign In
                 <ArrowRight className="size-4" />
               </Button>
             </form>
 
-            <div className="text-center flex flex-col items-center gap-3">
-              <button
-                type="button"
-                onClick={() => setIsSignUp(!isSignUp)}
-                className="text-sm text-muted-foreground hover:text-foreground transition-colors"
-              >
-                {isSignUp 
-                  ? "Already have an account? Sign in"
-                  : "Need an account? Sign up"}
-              </button>
-              
+            <div className="text-center mt-6">
               <Link
                 href="/register"
-                className="text-sm font-medium text-foreground hover:underline transition-colors"
+                className="text-sm text-muted-foreground hover:text-foreground transition-colors"
+                onClick={() => {
+                   // Optional routing cleanup if necessary
+                }}
               >
-                Register
+                Need an account? Register
               </Link>
             </div>
           </motion.div>
