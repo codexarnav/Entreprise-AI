@@ -75,19 +75,11 @@ class PromptInput(BaseModel):
     # Optional file/document context
     file_path: Optional[str] = None
     file_content: Optional[str] = None
-    # Optional URL context (for scraping, email services, etc)
     url: Optional[str] = None
-    # Optional email configuration
     email_config: Optional[Dict[str, Any]] = None  # {folder: "inbox", service: "gmail", etc}
-    # Optional additional context
     context: Optional[Dict[str, Any]] = None  # {vendor_name, requirement, client, etc}
-    # Session identity
     session_id: Optional[str] = None
     user_id:    Optional[str] = None
-    # Prior session context loaded from MongoDB by the background runner.
-    # Injected before orchestrate() is called — orchestrate() is sync so it
-    # cannot await Mongo directly.  Shape mirrors session.context[-1]:
-    # { last_workflow, last_intent, results: {...distilled...}, history: [...] }
     prior_context: Optional[Dict[str, Any]] = None
 
 
@@ -203,28 +195,31 @@ USER PROMPT:
 {prompt}
 
 TASK:
-1. Determine PRIMARY INTENT (rfp, procurement, onboarding, competitor, email, scraping)
+1. Determine PRIMARY INTENT
 2. Identify ACTION category
 3. Extract key entities from prompt
 4. Assess priority level
 5. Flag critical issues
 
 INTENT TYPES:
+- "conversational" → Greetings, capability questions, small talk, help requests (e.g. "hi", "what can you do", "how does this work", "hello")
 - "rfp" → RFP document processing (upload, analyze, match requirements, pricing, proposals)
 - "procurement" → Vendor sourcing and negotiation
 - "onboarding" → KYC, risk assessment, vendor onboarding
 - "competitor" → Market and competitor intelligence
 - "email" → Email scanning and extraction for business documents
 - "scraping" → Web scraping for tenders, market data
-- "unknown" → Cannot determine
+- "unknown" → Cannot determine even after careful analysis
 
 WORKFLOW MAPPING:
+- intent="conversational" → workflow="conversational"
 - intent="rfp" → workflow="rfp"
 - intent="procurement" → workflow="procurement"
 - intent="onboarding" → workflow="onboarding"
 - intent="competitor" → workflow="competitor_analysis"
 - intent="email" → workflow="hybrid"
 - intent="scraping" → workflow="hybrid"
+- intent="unknown" → workflow="unknown"
 
 ACTION EXAMPLES (handle variations):
 - "check emails for rfps" | "scan my mailbox for rfp requests" → intent="email", action="scan_emails_for_rfp"
@@ -465,32 +460,45 @@ Return ONLY valid JSON. No explanations.
 def task_decomposition(goal: Goal) -> List[Task]:
     """
     LAYER 3: TASK DECOMPOSITION
-    LLM CALL #2 of 2 (FINAL LLM CALL)
+    Short-circuits conversational/unknown intents — no LLM decomposition needed.
+    Only calls LLM for real business workflows.
     """
     logger.info("📋 TASK DECOMPOSITION: Breaking down goal...")
-    
+
+    # ── Short-circuit: no agents for conversational or unrecognised prompts ──
+    if goal.workflow in ("conversational", "unknown"):
+        logger.info(f"⚡ Short-circuit: workflow='{goal.workflow}' → single general_response task")
+        return [Task(
+            id="t1",
+            task_name="General Response",
+            tool_name="general_response",
+            description="Reply to the user's message directly using LLM",
+            required_inputs={"original_goal": goal.objective},
+            dependencies=[],
+            priority=0
+        )]
+
     llm = get_llm()
-    
     prompt = PromptTemplate(
         input_variables=["goal", "workflow"],
         template=DECOMPOSITION_PROMPT
     )
-    
+
     try:
         response = llm.invoke(prompt.format(
             goal=goal.objective,
             workflow=goal.workflow
         ))
-        
+
         response_text = response.content.strip()
         if response_text.startswith("```"):
             response_text = response_text.split("```")[1]
             if response_text.startswith("json"):
                 response_text = response_text[4:]
             response_text = response_text.split("```")[0].strip()
-        
+
         decomposition_data = json.loads(response_text)
-        
+
         tasks = []
         for task_data in decomposition_data.get("tasks", []):
             task = Task(
@@ -503,10 +511,10 @@ def task_decomposition(goal: Goal) -> List[Task]:
                 priority=task_data.get("priority", 0)
             )
             tasks.append(task)
-        
+
         logger.info(f"✓ Decomposed: {len(tasks)} tasks")
         return tasks
-    
+
     except Exception as e:
         logger.error(f"❌ Decomposition error: {e}")
         logger.error(traceback.format_exc())
@@ -525,6 +533,7 @@ class ToolSelector:
     def _build_tool_registry(self) -> Dict[str, Callable]:
         """Build mapping of tool names to actual functions"""
         return {
+            "general_response": self._run_general_response,
             "email_handler": self._run_email_handler,
             "tender_scraper": self._run_tender_scraper,
             "rfp_aggregator": self._run_rfp_aggregator,
@@ -568,6 +577,44 @@ class ToolSelector:
                 "error": str(e)
             }
     
+    # ========== CONVERSATIONAL / GENERAL RESPONSE ==========
+
+    def _run_general_response(self, task: Task) -> Dict:
+        """Handle conversational prompts and capability questions with a direct LLM reply."""
+        try:
+            llm = get_llm()
+            system_prompt = """You are an Enterprise AI Assistant for OEM companies.
+You help with:
+- RFP Processing: Parse RFP documents, match requirements to your SKU catalog, assess risks, calculate pricing, generate proposals
+- Tender Scraping: Scrape government tender portals (eProcure, ISRO, etc.) for opportunities
+- Email Scanning: Scan Gmail inbox for incoming RFPs and business documents
+- Vendor Procurement: Evaluate, score and select vendors
+- Vendor Onboarding: KYC verification, document verification, risk assessment
+- Competitor Analysis: Gather market intelligence on competitors (requires URLs)
+
+Answer the user's message naturally and helpfully. If they ask what you can do, explain these capabilities clearly."""
+
+            user_msg = task.required_inputs.get("original_goal", "Hello")
+            response = llm.invoke(f"{system_prompt}\n\nUser: {user_msg}")
+            reply = response.content.strip()
+
+            logger.info(f"✓ General response generated ({len(reply)} chars)")
+            return {
+                "status": "success",
+                "data": {
+                    "reply": reply,
+                    "type": "conversational"
+                }
+            }
+        except Exception as e:
+            return {
+                "status": "success",
+                "data": {
+                    "reply": "I'm your Enterprise AI Assistant. I can help with RFP processing, tender scraping, vendor procurement, onboarding, and competitor analysis. What would you like to do?",
+                    "type": "conversational"
+                }
+            }
+
     # ========== INPUT HANDLER TOOLS ==========
     
     def _run_email_handler(self, task: Task) -> Dict:
@@ -715,58 +762,180 @@ class ToolSelector:
             return {"status": "error", "error": str(e)}
     
     def _run_technical_agent(self, task: Task) -> Dict:
-        """Execute Technical Requirements Matching"""
+        """Execute Technical Requirements Matching against the OEM SKU catalog."""
         try:
             requirements = self.state.results.get("technical_requirements", [])
-            
             if not requirements:
-                return {"status": "skipped", "reason": "No requirements"}
-            
-            logger.info(f"🔬 Matching {len(requirements)} requirements to SKUs...")
-            
-            # Initialize Technical Agent with vectorstore
-            agent = TechnicalAgent(
-                vectorstore_path="./product_vectorstore",
-                similarity_threshold=0.80
-            )
-            
-            # Create RFP requirements objects
-            rfp_requirements = []
-            for i, req in enumerate(requirements):
-                req_obj = RFPRequirement(
+                # Fall back to the prompt itself as a broad requirement
+                prompt_req = self.input_data.user_context or ""
+                if prompt_req:
+                    requirements = [prompt_req]
+                else:
+                    return {"status": "skipped", "reason": "No requirements to match"}
+
+            logger.info(f"🔬 Matching {len(requirements)} requirements to SKU catalog...")
+
+            from pathlib import Path
+            backend_root = Path(__file__).resolve().parent.parent
+            vs_path = str(backend_root / "product_vectorstore")
+
+            agent = TechnicalAgent(vectorstore_path=vs_path, similarity_threshold=0.70)
+
+            # ── Seed demo SKUs if catalog is empty ───────────────────────
+            DEMO_SKUS = [
+                {
+                    "sku_id": "CBL-1100-XLPE-ARM",
+                    "product_name": "1.1kV XLPE Armoured Cable",
+                    "description": "Medium-voltage XLPE insulated, steel-wire armoured power cable rated 1.1kV for industrial use.",
+                    "category": "Cable",
+                    "parameters": {"voltage": "1.1kV", "insulation": "XLPE", "armour": "SWA", "conductor": "Copper"},
+                    "spec_sheet_url": ""
+                },
+                {
+                    "sku_id": "SOL-400W-MONO",
+                    "product_name": "400W Mono-crystalline Solar Panel",
+                    "description": "High-efficiency 400W monocrystalline photovoltaic panel with 21.5% efficiency for rooftop and ground installations.",
+                    "category": "Solar",
+                    "parameters": {"wattage": "400W", "type": "Monocrystalline", "efficiency": "21.5%", "warranty": "25 years"},
+                    "spec_sheet_url": ""
+                },
+                {
+                    "sku_id": "INV-50KVA-3P",
+                    "product_name": "50kVA Three-Phase Inverter",
+                    "description": "50kVA three-phase solar inverter with MPPT, grid-tie capability and RS485 monitoring.",
+                    "category": "Inverter",
+                    "parameters": {"capacity": "50kVA", "phases": "3", "mppt": "yes", "grid_tie": "yes"},
+                    "spec_sheet_url": ""
+                },
+                {
+                    "sku_id": "TRANS-630KVA-11KV",
+                    "product_name": "630kVA 11kV Distribution Transformer",
+                    "description": "Oil-cooled 630kVA distribution transformer, 11kV/433V, ONAN cooling, IS 2026 compliant.",
+                    "category": "Transformer",
+                    "parameters": {"capacity": "630kVA", "primary": "11kV", "secondary": "433V", "cooling": "ONAN"},
+                    "spec_sheet_url": ""
+                },
+                {
+                    "sku_id": "SWGR-LV-ACB",
+                    "product_name": "LV Switchgear Panel with ACB",
+                    "description": "Low-voltage switchgear panel with air circuit breaker, bus bar, and digital metering for industrial substations.",
+                    "category": "Switchgear",
+                    "parameters": {"voltage": "415V", "breaker": "ACB", "rating": "2000A", "enclosure": "IP54"},
+                    "spec_sheet_url": ""
+                },
+                {
+                    "sku_id": "BATT-150AH-VRLA",
+                    "product_name": "150Ah VRLA Battery Bank",
+                    "description": "Sealed VRLA (AGM) 150Ah battery for UPS and solar storage applications, 12V nominal.",
+                    "category": "Battery",
+                    "parameters": {"capacity": "150Ah", "voltage": "12V", "type": "VRLA/AGM", "cycle_life": "500 cycles"},
+                    "spec_sheet_url": ""
+                },
+                {
+                    "sku_id": "MCC-415V-FVNR",
+                    "product_name": "415V Motor Control Centre (MCC)",
+                    "description": "Full-voltage non-reversing MCC panel for motor control, with overload protection and PLC interface.",
+                    "category": "Motor Control",
+                    "parameters": {"voltage": "415V", "starter": "FVNR", "communication": "PLC", "protection": "IP42"},
+                    "spec_sheet_url": ""
+                },
+                {
+                    "sku_id": "GENSET-125KVA-DG",
+                    "product_name": "125kVA Diesel Generator Set",
+                    "description": "125kVA / 100kW open-type diesel generator with AVR, CPCB-II compliant, for standby power.",
+                    "category": "Generator",
+                    "parameters": {"capacity": "125kVA", "fuel": "Diesel", "standard": "CPCB-II", "voltage": "415V"},
+                    "spec_sheet_url": ""
+                },
+            ]
+            try:
+                # Check if collection has documents
+                count = agent.vectorstore._collection.count()
+                if count == 0:
+                    logger.info(f"   Vectorstore empty — seeding {len(DEMO_SKUS)} demo SKUs")
+                    agent.add_products_to_catalog(DEMO_SKUS)
+                else:
+                    logger.info(f"   Vectorstore has {count} products")
+            except Exception:
+                logger.info("   Seeding demo SKUs into vectorstore")
+                agent.add_products_to_catalog(DEMO_SKUS)
+
+            # ── Semantic matching ───────────────────────────────
+            rfp_requirements = [
+                RFPRequirement(
                     id=f"req_{i+1}",
                     description=str(req),
                     parameters={},
                     category="general",
                     priority="high"
                 )
-                rfp_requirements.append(req_obj)
-            
-            # Run semantic matching
+                for i, req in enumerate(requirements)
+            ]
+
             matched_skus = []
             technical_gaps = []
-            
-            # This is a simplified implementation - in production would use full agent
+            total_base_cost = 0.0
+
             for req in rfp_requirements:
-                # Mock semantic matching (actual implementation uses Chroma vectorstore)
-                match = {
-                    "requirement_id": req.id,
-                    "matched_skus": [],
-                    "confidence": 0.75,
-                    "gap": None
-                }
-                matched_skus.append(match)
-            
-            logger.info(f"✓ Matched {len(matched_skus)} requirements")
-            
+                results = agent.vectorstore.similarity_search_with_score(
+                    req.description, k=3
+                )
+                best_matches = []
+                for doc, score in results:
+                    similarity = 1.0 - score  # Chroma returns L2 distance
+                    if similarity >= agent.similarity_threshold:
+                        meta = doc.metadata
+                        unit_price = _sku_unit_price(meta.get("sku_id", ""), meta.get("category", ""))
+                        best_matches.append({
+                            "sku_id": meta.get("sku_id", ""),
+                            "product_name": meta.get("product_name", doc.page_content[:60]),
+                            "category":     meta.get("category", ""),
+                            "similarity":   round(similarity, 3),
+                            "unit_price":   unit_price,
+                            "quantity":     1,
+                            "line_total":   unit_price,
+                        })
+                        total_base_cost += unit_price
+
+                if best_matches:
+                    matched_skus.append({
+                        "requirement_id":   req.id,
+                        "requirement_text": req.description,
+                        "matched_products": best_matches,
+                        "best_match":       best_matches[0],
+                        "confidence":       best_matches[0]["similarity"],
+                        "gap":              None,
+                    })
+                else:
+                    technical_gaps.append(req.description)
+                    matched_skus.append({
+                        "requirement_id":   req.id,
+                        "requirement_text": req.description,
+                        "matched_products": [],
+                        "best_match":       None,
+                        "confidence":       0.0,
+                        "gap":              "No matching SKU found in catalog",
+                    })
+
+            avg_confidence = (
+                sum(m["confidence"] for m in matched_skus) / len(matched_skus)
+                if matched_skus else 0.0
+            )
+            logger.info(f"✓ Matched {len(matched_skus) - len(technical_gaps)}/{len(matched_skus)} requirements | base cost: INR {total_base_cost:,.0f}")
+
+            # Persist base cost so pricing agent can use it
+            self.state.results["sku_base_cost"] = total_base_cost
+
             return {
                 "status": "success",
                 "data": {
-                    "matched_skus": matched_skus,
-                    "technical_gaps": technical_gaps,
-                    "match_confidence": 0.75,
-                    "total_requirements": len(rfp_requirements),
-                    "matched_requirements": len(matched_skus)
+                    "matched_skus":         matched_skus,
+                    "technical_gaps":       technical_gaps,
+                    "match_confidence":     round(avg_confidence, 3),
+                    "total_requirements":   len(rfp_requirements),
+                    "matched_requirements": len(matched_skus) - len(technical_gaps),
+                    "sku_base_cost":        total_base_cost,
+                    "catalog_size":         len(DEMO_SKUS)
                 }
             }
         except Exception as e:
@@ -774,56 +943,69 @@ class ToolSelector:
             return {"status": "error", "error": str(e)}
     
     def _run_dynamic_pricing(self, task: Task) -> Dict:
-        """Execute Dynamic Pricing Agent"""
+        """Dynamic pricing built from actual SKU matches produced by the technical agent."""
         try:
-            logger.info("💰 Calculating competitive pricing...")
-            
-            # Get matched SKUs and technical data
-            matched_skus = self.state.results.get("technical_agent", {}).get("matched_skus", [])
-            risk_data = self.state.results.get("risk_compliance", {})
-            
-            # Base pricing logic
-            base_cost = 100000  # Default base cost
-            
-            # Apply risk-based adjustments
-            risk_score = risk_data.get("risk_score", 0.0)
-            risk_buffer = base_cost * (risk_score * 0.15)  # 0-15% buffer based on risk
-            
-            # Innovation cost estimation
-            innovation_cost = 0
-            for match in matched_skus or []:
-                if match.get('gap') or match.get('is_innovation'):
-                    innovation_cost += base_cost * 0.20  # 20% for innovation
-            
-            # Calculate margins
-            base_margin = 0.25  # 25% base margin
-            strategic_margin = 0.05  # Additional 5% for strategic positioning
-            total_margin = base_margin + strategic_margin
-            
-            # Final pricing
-            total_cost = base_cost + risk_buffer + innovation_cost
-            margin_amount = total_cost * total_margin
-            total_price = total_cost + margin_amount
-            
-            logger.info(f"✓ Base: ${base_cost:,.0f} | Risk: ${risk_buffer:,.0f} | Innovation: ${innovation_cost:,.0f} | Total: ${total_price:,.0f}")
-            
+            logger.info("💰 Calculating competitive pricing from SKU matches...")
+
+            tech_data   = self.state.results.get("technical_agent", {})
+            risk_data   = self.state.results.get("risk_compliance", {})
+            matched_skus = tech_data.get("matched_skus", [])
+
+            # ── Build cost from matched SKUs ──────────────────────────
+            line_items = []
+            base_cost  = self.state.results.get("sku_base_cost", 0.0)
+
+            for match in matched_skus:
+                best = match.get("best_match")
+                if best:
+                    line_items.append({
+                        "sku_id":       best.get("sku_id"),
+                        "product_name": best.get("product_name"),
+                        "quantity":     best.get("quantity", 1),
+                        "unit_price":   best.get("unit_price", 0),
+                        "line_total":   best.get("line_total", 0),
+                    })
+
+            # Fallback if nothing came through the pipeline
+            if base_cost == 0:
+                base_cost = 1_00_000  # INR 1 lakh default
+                logger.info("   No SKU cost data — using default base cost")
+
+            # ── Adjustments ────────────────────────────────────
+            risk_score     = risk_data.get("risk_score", 0.0)
+            risk_buffer    = base_cost * (risk_score * 0.15)   # 0–15 %
+
+            gaps           = tech_data.get("technical_gaps", [])
+            innovation_cost = base_cost * 0.20 * len(gaps)     # 20 % per gap
+
+            subtotal       = base_cost + risk_buffer + innovation_cost
+            margin_pct     = 0.30                               # 30 % margin
+            margin_amount  = subtotal * margin_pct
+            total_price    = subtotal + margin_amount
+
+            logger.info(
+                f"✓ Base: INR {base_cost:,.0f} | Risk: INR {risk_buffer:,.0f} | "
+                f"Innovation gaps: {len(gaps)} | Total: INR {total_price:,.0f}"
+            )
+
             return {
                 "status": "success",
                 "data": {
-                    "base_cost": base_cost,
-                    "risk_buffer": risk_buffer,
-                    "innovation_cost": innovation_cost,
-                    "subtotal": total_cost,
-                    "margin_percentage": total_margin * 100,
-                    "margin_amount": margin_amount,
-                    "total_price": total_price,
+                    "line_items":        line_items,
+                    "base_cost":         round(base_cost, 2),
+                    "risk_buffer":       round(risk_buffer, 2),
+                    "innovation_cost":   round(innovation_cost, 2),
+                    "subtotal":          round(subtotal, 2),
+                    "margin_percentage": margin_pct * 100,
+                    "margin_amount":     round(margin_amount, 2),
+                    "total_price":       round(total_price, 2),
+                    "currency":          "INR",
                     "pricing_breakdown": {
-                        "base": base_cost,
-                        "risk_adjusted": risk_buffer,
-                        "innovation": innovation_cost,
-                        "margin": margin_amount
-                    },
-                    "currency": "INR"
+                        "sku_cost":        round(base_cost, 2),
+                        "risk_adjusted":   round(risk_buffer, 2),
+                        "innovation_gaps": round(innovation_cost, 2),
+                        "margin":          round(margin_amount, 2),
+                    }
                 }
             }
         except Exception as e:
@@ -1906,8 +2088,12 @@ def orchestrate(prompt_input: PromptInput) -> OrchestrationOutput:
             workflow_type=perception.workflow,
             rfp_pdf_path=perception.entities.get("rfp_pdf_path"),
             tender_url=perception.entities.get("tender_url"),
-            email_text=perception.entities.get("email_config"),
-            vendor_details=perception.entities.get("vendor_details"),  # was missing before
+            email_text=(
+                json.dumps(perception.entities["email_config"])
+                if isinstance(perception.entities.get("email_config"), dict)
+                else perception.entities.get("email_config")  # already a str or None
+            ),
+            vendor_details=perception.entities.get("vendor_details"),
             user_context=json.dumps(perception.entities)
         )
         state = execution_loop(state, tasks, compat_input)

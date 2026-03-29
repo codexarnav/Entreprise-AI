@@ -1,3 +1,6 @@
+from dotenv import load_dotenv
+load_dotenv()  # MUST be first — database.py reads env vars at import time
+
 import asyncio
 import logging
 import uuid
@@ -6,6 +9,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
+from fastapi.security import OAuth2PasswordBearer
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -59,16 +63,21 @@ def _docs(lst: list) -> list:
     return [_doc(d) for d in lst]
 
 
-async def get_current_user(authorization: str = Header(default=None)) -> dict:
-    if not authorization:
-        raise HTTPException(401, "Authorization header missing")
-    scheme, _, token = authorization.partition(" ")
-    if scheme.lower() != "bearer":
-        raise HTTPException(401, "Invalid auth scheme — use Bearer")
+# OAuth2PasswordBearer tells Swagger to show the lock icon and auto-attach
+# "Authorization: Bearer <token>" to every endpoint that Depends on this.
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
+
+async def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
     payload = decode_token(token)
     if not payload:
         raise HTTPException(401, "Invalid or expired token")
     return payload
+
+
+# ── Debug endpoint (remove after confirming auth works) ───────────────────────
+@app.get("/debug-auth", tags=["Debug"])
+async def debug_auth(token: str = Depends(oauth2_scheme)):
+    return {"token": token}
 
 
 # ── Background runner ─────────────────────────────────────────────────────────
@@ -84,7 +93,7 @@ async def run_workflow(
 ) -> None:
     db = get_db()
     try:
-        # 1. Load prior session context from Mongo
+       
         prior_context: Optional[Dict] = None
         if session_id:
             session = await db["sessions"].find_one({"_id": session_id})
@@ -137,9 +146,7 @@ async def run_workflow(
         final_status = status_map.get(output.status, "failed")
         now = datetime.utcnow()
 
-        # 5. Update workflow document — include perception/goal extracted during orchestration
-        # output.results may contain a "_meta" key with perception + goal if the
-        # orchestrator stored it; otherwise store what we have.
+       
         await db["workflows"].update_one(
             {"_id": workflow_id},
             {"$set": {

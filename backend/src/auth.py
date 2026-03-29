@@ -2,7 +2,8 @@ import uuid
 from datetime import datetime
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel
 
 from src.database import get_db
@@ -17,11 +18,6 @@ class RegisterReq(BaseModel):
     password: str
     role: str = "oem"
     email_config: Optional[Dict[str, Any]] = None   # {gmail_id, app_password}
-
-
-class LoginReq(BaseModel):
-    email: str
-    password: str
 
 
 @router.post("/register")
@@ -43,10 +39,15 @@ async def register(req: RegisterReq):
 
 
 @router.post("/login")
-async def login(req: LoginReq):
+async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    """
+    Swagger Authorize button sends form-encoded: username + password.
+    Returns access_token + token_type so Swagger stores it automatically.
+    """
     db = get_db()
-    user = await db["users"].find_one({"email": req.email})
-    if not user or not verify_password(req.password, user["hashed_password"]):
+    # Swagger sends 'username' field — we treat it as email
+    user = await db["users"].find_one({"email": form_data.username})
+    if not user or not verify_password(form_data.password, user["hashed_password"]):
         raise HTTPException(401, "Invalid credentials")
 
     session_id = str(uuid.uuid4())
@@ -65,4 +66,10 @@ async def login(req: LoginReq):
         "session_id": session_id,
         "role": user.get("role", "oem"),
     })
-    return {"user_id": user["_id"], "token": token, "session_id": session_id}
+    # MUST return these exact keys — Swagger reads access_token + token_type
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "user_id": user["_id"],
+        "session_id": session_id,
+    }
