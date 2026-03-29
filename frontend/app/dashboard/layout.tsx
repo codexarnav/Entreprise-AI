@@ -4,15 +4,16 @@ import { useEffect, useState } from "react"
 import Link from "next/link"
 import { usePathname, useRouter } from "next/navigation"
 import { motion } from "framer-motion"
-import { 
-  Cpu, 
-  LayoutDashboard, 
-  FileText, 
-  Users, 
-  Activity, 
+import {
+  Cpu,
+  LayoutDashboard,
+  FileText,
+  Users,
+  Activity,
   MessageSquare,
   Settings,
-  LogOut
+  LogOut,
+  Target
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
@@ -21,6 +22,7 @@ const navItems = [
   { icon: LayoutDashboard, label: "Dashboard", href: "/dashboard" },
   { icon: FileText, label: "RFPs", href: "/dashboard/rfps" },
   { icon: Users, label: "Vendors", href: "/dashboard/vendors" },
+  { icon: Target, label: "Competitors", href: "/dashboard/competitor" },
   { icon: Activity, label: "Agent Monitor", href: "/dashboard/monitor" },
   { icon: MessageSquare, label: "Discussions", href: "/dashboard/discussions" },
 ]
@@ -81,9 +83,9 @@ export default function DashboardLayout({
           {/* Navigation */}
           <nav className="flex-1 flex flex-col gap-2">
             {navItems.map((item) => {
-              const isActive = pathname === item.href || 
+              const isActive = pathname === item.href ||
                 (item.href !== "/dashboard" && pathname.startsWith(item.href))
-              
+
               return (
                 <Tooltip key={item.href} delayDuration={0}>
                   <TooltipTrigger asChild>
@@ -91,8 +93,8 @@ export default function DashboardLayout({
                       href={item.href}
                       className={cn(
                         "relative size-10 rounded-xl flex items-center justify-center transition-all",
-                        isActive 
-                          ? "bg-primary text-primary-foreground" 
+                        isActive
+                          ? "bg-primary text-primary-foreground"
                           : "text-muted-foreground hover:text-foreground hover:bg-muted"
                       )}
                     >
@@ -129,7 +131,7 @@ export default function DashboardLayout({
                 Settings
               </TooltipContent>
             </Tooltip>
-            
+
             <Tooltip delayDuration={0}>
               <TooltipTrigger asChild>
                 <button

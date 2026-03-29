@@ -1,91 +1,144 @@
 "use client"
 
 import { motion } from "framer-motion"
-import { Calendar, Building2, AlertTriangle, ArrowRight } from "lucide-react"
+import { FileText, Calendar, AlertTriangle, ArrowRight, Globe, Upload, Rss } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
-import { ConfidenceGauge } from "./confidence-gauge"
 
+// Shape returned by GET /rfps (backend _id is mapped to id by _doc helper)
 export interface RFPData {
   id: string
-  title: string
-  organization: string
-  deadline: string
-  pwinScore: number
-  riskScore: number
-  status: "new" | "analyzing" | "ready" | "in-progress" | "completed"
-  value: string
-  category: string
+  source: "email" | "upload" | "scraper" | string
+  document_path: string | null
+  parsed_data: Record<string, unknown> | null
+  risk_analysis: Record<string, unknown> | null
+  technical_fit: Record<string, unknown> | null
+  pricing: Record<string, unknown> | null
+  status: "processed" | "pending" | string
+  created_at: string | null
 }
 
 interface RFPCardProps {
   rfp: RFPData
-  onProceed: (id: string) => void
+  onClick: (id: string) => void
 }
 
-const statusConfig = {
-  new: { label: "New", color: "bg-neon-blue/20 text-neon-blue" },
-  analyzing: { label: "Analyzing", color: "bg-neon-amber/20 text-neon-amber" },
-  ready: { label: "Ready", color: "bg-neon-green/20 text-neon-green" },
-  "in-progress": { label: "In Progress", color: "bg-neon-cyan/20 text-neon-cyan" },
-  completed: { label: "Completed", color: "bg-muted text-muted-foreground" },
+const statusConfig: Record<string, { label: string; color: string }> = {
+  processed: { label: "Processed", color: "bg-neon-green/20 text-neon-green" },
+  pending:   { label: "Pending",   color: "bg-neon-amber/20 text-neon-amber" },
 }
 
-export function RFPCard({ rfp, onProceed }: RFPCardProps) {
-  const status = statusConfig[rfp.status]
+const sourceIcon: Record<string, React.ReactNode> = {
+  email:   <Rss className="size-3" />,
+  upload:  <Upload className="size-3" />,
+  scraper: <Globe className="size-3" />,
+}
+
+function getStatusCfg(status: string) {
+  return statusConfig[status] ?? { label: status, color: "bg-muted/50 text-muted-foreground" }
+}
+
+/** Try to pull a human-readable title from parsed_data, or fall back to document path / id */
+function getTitle(rfp: RFPData): string {
+  const pd = rfp.parsed_data
+  if (pd) {
+    const t = pd["title"] ?? pd["name"] ?? pd["rfp_title"] ?? pd["subject"]
+    if (t && typeof t === "string") return t
+  }
+  if (rfp.document_path) {
+    // Use the filename portion of the path
+    const parts = rfp.document_path.replace(/\\/g, "/").split("/")
+    return parts[parts.length - 1] || rfp.id
+  }
+  return rfp.id
+}
+
+function getRiskLevel(rfp: RFPData): { label: string; high: boolean } | null {
+  const ra = rfp.risk_analysis
+  if (!ra) return null
+  const score =
+    typeof ra["risk_score"] === "number"
+      ? ra["risk_score"]
+      : typeof ra["score"] === "number"
+      ? ra["score"]
+      : null
+  if (score === null) return null
+  return { label: `Risk: ${(score * 100).toFixed(0)}%`, high: score > 0.5 }
+}
+
+function getDate(rfp: RFPData): string | null {
+  const raw = rfp.created_at
+  if (!raw) return null
+  try {
+    return new Date(raw).toLocaleDateString("en-IN", {
+      day: "numeric",
+      month: "short",
+      year: "numeric",
+    })
+  } catch {
+    return null
+  }
+}
+
+export function RFPCard({ rfp, onClick }: RFPCardProps) {
+  const status  = getStatusCfg(rfp.status)
+  const title   = getTitle(rfp)
+  const risk    = getRiskLevel(rfp)
+  const date    = getDate(rfp)
+  const srcIcon = sourceIcon[rfp.source] ?? <FileText className="size-3" />
 
   return (
     <motion.div
       initial={{ opacity: 0, y: 20 }}
       animate={{ opacity: 1, y: 0 }}
       whileHover={{ y: -4 }}
-      className="glass-card p-6 group hover:border-primary/50 transition-all duration-300"
+      onClick={() => onClick(rfp.id)}
+      className="glass-card p-6 group hover:border-primary/50 transition-all duration-300 cursor-pointer"
     >
       <div className="flex items-start justify-between mb-4">
-        <div className="flex-1">
-          <div className="flex items-center gap-2 mb-2">
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2 mb-2 flex-wrap">
             <Badge variant="outline" className={status.color}>
               {status.label}
             </Badge>
-            <Badge variant="outline" className="bg-muted/50">
-              {rfp.category}
+            <Badge variant="outline" className="bg-muted/50 flex items-center gap-1">
+              {srcIcon}
+              <span className="capitalize">{rfp.source}</span>
             </Badge>
           </div>
           <h3 className="font-semibold text-foreground line-clamp-2 mb-1">
-            {rfp.title}
+            {title}
           </h3>
-          <div className="flex items-center gap-2 text-sm text-muted-foreground">
-            <Building2 className="size-3" />
-            <span>{rfp.organization}</span>
-          </div>
+          {date && (
+            <div className="flex items-center gap-2 text-sm text-muted-foreground">
+              <Calendar className="size-3" />
+              <span>{date}</span>
+            </div>
+          )}
         </div>
-        
-        <ConfidenceGauge value={rfp.pwinScore} size="sm" label="P(Win)" />
       </div>
 
       <div className="flex items-center justify-between pt-4 border-t border-border">
         <div className="flex items-center gap-4 text-sm">
-          <div className="flex items-center gap-1.5 text-muted-foreground">
-            <Calendar className="size-3" />
-            <span>{rfp.deadline}</span>
-          </div>
-          
-          {rfp.riskScore > 50 && (
-            <div className="flex items-center gap-1.5 text-neon-amber">
-              <AlertTriangle className="size-3" />
-              <span>Risk: {rfp.riskScore}%</span>
+          {risk && (
+            <div className={`flex items-center gap-1.5 ${risk.high ? "text-neon-amber" : "text-muted-foreground"}`}>
+              {risk.high && <AlertTriangle className="size-3" />}
+              <span>{risk.label}</span>
             </div>
           )}
-          
-          <span className="text-neon-green font-medium">{rfp.value}</span>
+          {rfp.pricing && typeof (rfp.pricing as Record<string,unknown>)["total_value"] === "string" && (
+            <span className="text-neon-green font-medium">
+              {(rfp.pricing as Record<string,unknown>)["total_value"] as string}
+            </span>
+          )}
         </div>
 
         <Button
           size="sm"
-          onClick={() => onProceed(rfp.id)}
           className="gap-1 opacity-0 group-hover:opacity-100 transition-opacity"
+          onClick={(e) => { e.stopPropagation(); onClick(rfp.id) }}
         >
-          Proceed <ArrowRight className="size-3" />
+          View <ArrowRight className="size-3" />
         </Button>
       </div>
     </motion.div>
