@@ -5,10 +5,10 @@ import { useEffect, useState } from "react"
 
 interface FloatingRobotProps {
   isTyping?: boolean
-  variant?: "oem" | "client"
+  variant?: "oem" | "client" | "vendor"
 }
 
-export function FloatingRobot({ isTyping = false, variant = "client" }: FloatingRobotProps) {
+export function FloatingRobot({ isTyping = false, variant = "vendor" }: FloatingRobotProps) {
   const [mousePosition, setMousePosition] = useState({ x: 0, y: 0 })
   const [blinking, setBlinking] = useState(false)
 

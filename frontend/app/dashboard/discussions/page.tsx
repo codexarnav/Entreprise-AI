@@ -111,11 +111,12 @@ export default function DiscussionsChatPage() {
     
     addMessage("user", inputMsg)
     const prompt = inputMsg
+    const currentSessionId = localStorage.getItem("session_id") || "demo-session"
     setInputMsg("")
 
     // Start mock workflow
     if (workflowState === "idle") {
-      startMockWorkflow(prompt)
+      startMockWorkflow(prompt, currentSessionId)
     } else {
       addMessage("ai", "A workflow is currently active. Please complete it or wait for it to finish.", true)
     }
@@ -129,7 +130,7 @@ export default function DiscussionsChatPage() {
   }
 
   // MOCK BACKEND LOGIC
-  const startMockWorkflow = (prompt: string) => {
+  const startMockWorkflow = (prompt: string, sId: string) => {
     const wId = "wf-" + Math.random().toString(36).substring(7)
     setWorkflowId(wId)
     setWorkflowState("running")
@@ -142,7 +143,7 @@ export default function DiscussionsChatPage() {
     }])
 
     setAuditLogs([
-      { event: "workflow_started", detail: { prompt, session_id: "demo-session" }, timestamp: new Date().toISOString() }
+      { event: "workflow_started", detail: { prompt, session_id: sId }, timestamp: new Date().toISOString() }
     ])
 
     // Simulate task 1 completion and dynamically appending the next task

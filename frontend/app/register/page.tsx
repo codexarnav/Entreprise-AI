@@ -3,23 +3,28 @@
 import { useState, useEffect } from "react"
 import { useSearchParams, useRouter } from "next/navigation"
 import { motion } from "framer-motion"
-import { Cpu, Building2, Users, ArrowRight, Eye, EyeOff } from "lucide-react"
+import { Cpu, Building2, Users, ArrowRight, Eye, EyeOff, Loader2 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { FloatingRobot } from "@/components/floating-robot"
 import Link from "next/link"
+import api from "@/lib/api"
 
 export default function RegisterPage() {
   const searchParams = useSearchParams()
   const router = useRouter()
-  const initialType = searchParams.get("type") as "oem" | "client" | null
+  const initialType = searchParams.get("type") as "oem" | "vendor" | null
   
-  const [portalType, setPortalType] = useState<"oem" | "client">(initialType || "client")
+  const [portalType, setPortalType] = useState<"oem" | "vendor">(initialType || "vendor")
   const [showPassword, setShowPassword] = useState(false)
   const [showAppPassword, setShowAppPassword] = useState(false)
   const [isTyping, setIsTyping] = useState(false)
+  const [isLoading, setIsLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  
   const [formData, setFormData] = useState({
+    username: "",
     email: "",
     password: "",
     gmail_id: "",
@@ -29,6 +34,7 @@ export default function RegisterPage() {
   const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     setFormData(prev => ({ ...prev, [e.target.name]: e.target.value }))
     setIsTyping(true)
+    setError(null)
   }
 
   useEffect(() => {
@@ -36,17 +42,37 @@ export default function RegisterPage() {
     return () => clearTimeout(timeout)
   }, [formData])
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
-    // Store portal type for dashboard theming
-    localStorage.setItem("portalType", portalType)
-    router.push("/dashboard")
+    setIsLoading(true)
+    setError(null)
+
+    try {
+      await api.post("/auth/register", {
+        username: formData.username || formData.email.split('@')[0],
+        email: formData.email,
+        password: formData.password,
+        role: portalType,
+        email_config: {
+          gmail_id: formData.gmail_id,
+          app_password: formData.app_password
+        }
+      })
+      
+      // On success, redirect to login
+      router.push("/auth")
+    } catch (err: any) {
+      console.error("Registration error:", err)
+      setError(err.response?.data?.detail || "Registration failed. Please try again.")
+    } finally {
+      setIsLoading(false)
+    }
   }
 
   const primaryColor = portalType === "oem" ? "neon-red" : "primary"
 
   return (
-    <div className={`min-h-screen bg-background flex ${portalType === "oem" ? "theme-oem" : "theme-client"}`}>
+    <div className={`min-h-screen bg-background flex ${portalType === "oem" ? "theme-oem" : "theme-vendor"}`}>
       {/* Left Panel - Branding */}
       <div className="hidden lg:flex lg:w-1/2 relative overflow-hidden">
         <div className="absolute inset-0 bg-gradient-to-br from-primary/20 via-background to-accent/10" />
@@ -98,7 +124,7 @@ export default function RegisterPage() {
                 </>
               ) : (
                 <>
-                  <span className="text-primary text-glow">Enterprise</span>
+                  <span className="text-primary text-glow">Vendor</span>
                   <br />
                   Registration
                 </>
@@ -108,14 +134,14 @@ export default function RegisterPage() {
             <p className="text-muted-foreground text-lg leading-relaxed max-w-md">
               {portalType === "oem" 
                 ? "Full access to vendor catalog, autonomous negotiations, and procurement analytics."
-                : "Monitor procurement progress, analyze RFPs, and track vendor performance."}
+                : "Join the network, manage RFPs, and participate in autonomous negotiations."}
             </p>
 
             <div className="mt-12 space-y-4">
               {[
-                portalType === "oem" ? "Vendor Catalog Access" : "Progress Monitoring",
-                portalType === "oem" ? "Negotiation Control" : "RFP Analysis View",
-                portalType === "oem" ? "Full Analytics Suite" : "Performance Reports",
+                portalType === "oem" ? "Vendor Catalog Access" : "Order Management",
+                portalType === "oem" ? "Negotiation Control" : "RFP Participation",
+                portalType === "oem" ? "Full Analytics Suite" : "Performance Analytics",
               ].map((feature, index) => (
                 <motion.div
                   key={feature}
@@ -139,15 +165,15 @@ export default function RegisterPage() {
           {/* Portal Type Toggle */}
           <div className="flex gap-2 mb-8 p-1 glass-card rounded-xl">
             <button
-              onClick={() => setPortalType("client")}
+              onClick={() => setPortalType("vendor")}
               className={`flex-1 flex items-center justify-center gap-2 py-3 rounded-lg transition-all ${
-                portalType === "client" 
+                portalType === "vendor" 
                   ? "bg-primary text-primary-foreground" 
                   : "text-muted-foreground hover:text-foreground"
               }`}
             >
               <Users className="size-4" />
-              <span className="text-sm font-medium">Client</span>
+              <span className="text-sm font-medium">Vendor</span>
             </button>
             <button
               onClick={() => setPortalType("oem")}
@@ -174,7 +200,27 @@ export default function RegisterPage() {
               </p>
             </div>
 
+            {error && (
+              <div className="p-3 rounded-lg bg-destructive/10 border border-destructive/20 text-destructive text-sm">
+                {error}
+              </div>
+            )}
+
             <form onSubmit={handleSubmit} className="space-y-4">
+              <div className="space-y-2">
+                <Label htmlFor="username">Full Name</Label>
+                <Input
+                  id="username"
+                  name="username"
+                  type="text"
+                  placeholder="John Doe"
+                  value={formData.username}
+                  onChange={handleInputChange}
+                  className="glass-button"
+                  required
+                />
+              </div>
+
               <div className="space-y-2">
                 <Label htmlFor="email">Email</Label>
                 <Input
@@ -213,7 +259,7 @@ export default function RegisterPage() {
               </div>
 
               <div className="space-y-2">
-                <Label htmlFor="gmail_id">Gmail ID</Label>
+                <Label htmlFor="gmail_id">Gmail ID (Optional)</Label>
                 <Input
                   id="gmail_id"
                   name="gmail_id"
@@ -222,12 +268,11 @@ export default function RegisterPage() {
                   value={formData.gmail_id}
                   onChange={handleInputChange}
                   className="glass-button"
-                  required
                 />
               </div>
               
               <div className="space-y-2">
-                <Label htmlFor="app_password">Gmail App Password</Label>
+                <Label htmlFor="app_password">Gmail App Password (Optional)</Label>
                 <div className="relative">
                   <Input
                     id="app_password"
@@ -237,7 +282,6 @@ export default function RegisterPage() {
                     value={formData.app_password}
                     onChange={handleInputChange}
                     className="glass-button pr-10"
-                    required
                   />
                   <button
                     type="button"
@@ -253,9 +297,16 @@ export default function RegisterPage() {
                 type="submit" 
                 className={`w-full gap-2 mt-4 ${portalType === "oem" ? "bg-neon-red hover:bg-neon-red/90" : ""}`}
                 size="lg"
+                disabled={isLoading}
               >
-                Create Account
-                <ArrowRight className="size-4" />
+                {isLoading ? (
+                  <Loader2 className="size-4 animate-spin" />
+                ) : (
+                  <>
+                    Create Account
+                    <ArrowRight className="size-4" />
+                  </>
+                )}
               </Button>
             </form>
 

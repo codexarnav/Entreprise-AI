@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react"
 import Link from "next/link"
-import { usePathname } from "next/navigation"
+import { usePathname, useRouter } from "next/navigation"
 import { motion } from "framer-motion"
 import { 
   Cpu, 
@@ -31,16 +31,44 @@ export default function DashboardLayout({
   children: React.ReactNode
 }) {
   const pathname = usePathname()
-  const [portalType, setPortalType] = useState<"oem" | "client">("client")
+  const router = useRouter()
+  const [portalType, setPortalType] = useState<"oem" | "vendor">("vendor")
+  const [isAuthorized, setIsAuthorized] = useState(false)
 
   useEffect(() => {
-    const stored = localStorage.getItem("portalType") as "oem" | "client" | null
+    const token = localStorage.getItem("token")
+    if (!token) {
+      router.replace("/auth")
+      return
+    }
+
+    const stored = localStorage.getItem("portalType") as "oem" | "vendor" | null
     if (stored) setPortalType(stored)
-  }, [])
+    setIsAuthorized(true)
+  }, [router])
+
+  const handleSignOut = () => {
+    localStorage.removeItem("token")
+    localStorage.removeItem("session_id")
+    localStorage.removeItem("user_id")
+    localStorage.removeItem("role")
+    router.push("/auth")
+  }
+
+  if (!isAuthorized) {
+    return (
+      <div className="min-h-screen bg-background flex items-center justify-center">
+        <div className="flex flex-col items-center gap-4">
+          <Cpu className="size-8 text-primary animate-pulse" />
+          <p className="text-muted-foreground animate-pulse">Initializing Secure Protocol...</p>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <TooltipProvider>
-      <div className={`min-h-screen bg-background flex ${portalType === "oem" ? "theme-oem" : "theme-client"}`}>
+      <div className={`min-h-screen bg-background flex ${portalType === "oem" ? "theme-oem" : "theme-vendor"}`}>
         {/* Glass Sidebar */}
         <aside className="fixed left-0 top-0 bottom-0 w-16 glass-card m-2 rounded-xl flex flex-col items-center py-4 z-50">
           {/* Logo */}
@@ -104,12 +132,12 @@ export default function DashboardLayout({
             
             <Tooltip delayDuration={0}>
               <TooltipTrigger asChild>
-                <Link
-                  href="/"
+                <button
+                  onClick={handleSignOut}
                   className="size-10 rounded-xl flex items-center justify-center text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-all"
                 >
                   <LogOut className="size-5" />
-                </Link>
+                </button>
               </TooltipTrigger>
               <TooltipContent side="right" className="glass-card">
                 Sign Out
