@@ -1,5 +1,5 @@
 from dotenv import load_dotenv
-load_dotenv()  # MUST be first — database.py reads env vars at import time
+load_dotenv()  
 
 import asyncio
 import logging
@@ -63,8 +63,7 @@ def _docs(lst: list) -> list:
     return [_doc(d) for d in lst]
 
 
-# OAuth2PasswordBearer tells Swagger to show the lock icon and auto-attach
-# "Authorization: Bearer <token>" to every endpoint that Depends on this.
+
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
 async def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:

@@ -5,7 +5,7 @@ from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 logger = logging.getLogger(__name__)
 
 MONGO_URI = os.getenv("MONGO_URI") 
-DB_NAME   = os.getenv("MONGODB_DB", "enterprise_ai")
+DB_NAME   = os.getenv("MONGODB_DB")
 
 _client: AsyncIOMotorClient = None
 
