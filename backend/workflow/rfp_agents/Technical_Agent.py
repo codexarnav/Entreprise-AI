@@ -3,13 +3,13 @@ Technical Agent for RFP-to-Product Matching
 Uses semantic embeddings and vector similarity for intelligent product matching
 """
 
-from typing import TypedDict, List, Dict, Optional, Annotated
+from typing import TypedDict, List, Dict, Optional, Annotated, Any
 from dataclasses import dataclass
 from datetime import datetime
 import operator
 
 from langgraph.graph import StateGraph, END
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain_core.documents import Document
@@ -80,7 +80,7 @@ class TechnicalAgent:
     
     def __init__(
         self,
-        embeddings: Optional[GoogleGenerativeAIEmbeddings] = None,
+        embeddings: Optional[Any] = None,
         llm: Optional[ChatGoogleGenerativeAI] = None,
         vectorstore_path: str = "./product_vectorstore",
         similarity_threshold: float = 0.80

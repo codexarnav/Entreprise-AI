@@ -85,7 +85,7 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
-def chunk_text(text: str, chunk_size: int = 2000, overlap: int = 300) -> List[str]:
+def chunk_text(text: str, chunk_size: int = 4000, overlap: int = 300) -> List[str]:
     
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
@@ -95,7 +95,7 @@ def chunk_text(text: str, chunk_size: int = 2000, overlap: int = 300) -> List[st
     return splitter.split_text(text)
 
 
-def compress_text(chunks: List[str], max_total_length: int = 8000) -> str:
+def compress_text(chunks: List[str], max_total_length: int = 10000) -> str:
     
     if not chunks:
         return ""
@@ -134,7 +134,7 @@ class CompetitorCrawler:
         self,
         product_url: str,
         company_url: str,
-        max_pages: int = 15,
+        max_pages: int = 10,
         max_depth: int = 2
     ) -> str:
         
@@ -326,7 +326,7 @@ def competitor_analysis_node(state: CompetitorWorkflowState) -> CompetitorWorkfl
         raw_content = crawler.crawl_urls(
             product_url=competitor_input.product_url,
             company_url=competitor_input.company_url,
-            max_pages=15,
+            max_pages=10,
             max_depth=2
         )
         
@@ -348,7 +348,7 @@ def competitor_analysis_node(state: CompetitorWorkflowState) -> CompetitorWorkfl
         
         # Step 4: Compress
         logger.info("Compressing chunked content to fit token budget")
-        compressed_content = compress_text(chunks, max_total_length=8000)
+        compressed_content = compress_text(chunks, max_total_length=30000)
         logger.info(f"Compressed to {len(compressed_content)} characters")
         
         # Step 5-6: LLM Analysis + Validation

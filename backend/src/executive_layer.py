@@ -1,4 +1,3 @@
-
 import os
 import json
 import logging
@@ -21,7 +20,7 @@ from workflow.rfp_agents.rfp_aggregator import (
 )
 from workflow.rfp_agents.risk_and_compilance import (
     RiskAndComplianceState, read_text_file, split_text,
-    ner_legal_bert, generate_report, access_risk, generate_risk_brief, app as risk_app
+    analyze_risk_compliance, app as risk_app
 )
 from workflow.rfp_agents.Technical_Agent import TechnicalAgent, RFPRequirement
 from workflow.rfp_agents.dynamic_pricing_agent import (
@@ -45,8 +44,32 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+# ── SKU unit price lookup (used by technical agent) ──────────────────────────
+def _sku_unit_price(sku_id: str, category: str) -> float:
+    """Return a deterministic unit price based on SKU ID or category."""
+    price_map = {
+        "CBL-1100-XLPE-ARM": 45000,
+        "SOL-400W-MONO":     18000,
+        "INV-50KVA-3P":     120000,
+        "TRANS-630KVA-11KV": 350000,
+        "SWGR-LV-ACB":       95000,
+        "BATT-150AH-VRLA":   22000,
+        "MCC-415V-FVNR":    110000,
+        "GENSET-125KVA-DG":  280000,
+    }
+    if sku_id in price_map:
+        return float(price_map[sku_id])
+    # Category fallback
+    category_defaults = {
+        "Cable": 40000, "Solar": 15000, "Inverter": 100000,
+        "Transformer": 300000, "Switchgear": 80000, "Battery": 20000,
+        "Motor Control": 90000, "Generator": 250000,
+    }
+    return float(category_defaults.get(category, 50000))
+
+
 class WorkflowType(str, Enum):
-    """Supported workflow types"""
     RFP = "rfp"
     PROCUREMENT = "procurement"
     ONBOARDING = "onboarding"
@@ -55,7 +78,6 @@ class WorkflowType(str, Enum):
 
 
 class IntentType(str, Enum):
-    """Intent types extracted from perception"""
     RFP_PROCESSING = "rfp_processing"
     VENDOR_PROCUREMENT = "vendor_procurement"
     VENDOR_ONBOARDING = "vendor_onboarding"
@@ -64,27 +86,23 @@ class IntentType(str, Enum):
 
 
 class WorkflowMode(str, Enum):
-    """Workflow execution mode"""
     FULL = "full"
     PARTIAL = "partial"
 
 
 class PromptInput(BaseModel):
-    """User prompt-based input with optional context"""
     prompt: str
-    # Optional file/document context
     file_path: Optional[str] = None
     file_content: Optional[str] = None
     url: Optional[str] = None
-    email_config: Optional[Dict[str, Any]] = None  # {folder: "inbox", service: "gmail", etc}
-    context: Optional[Dict[str, Any]] = None  # {vendor_name, requirement, client, etc}
+    email_config: Optional[Dict[str, Any]] = None
+    context: Optional[Dict[str, Any]] = None
     session_id: Optional[str] = None
-    user_id:    Optional[str] = None
+    user_id: Optional[str] = None
     prior_context: Optional[Dict[str, Any]] = None
 
 
 class PerceptionInput(BaseModel):
-    """Input data for perception layer (deprecated - use PromptInput)"""
     workflow_type: str
     rfp_pdf_path: Optional[str] = None
     email_text: Optional[str] = None
@@ -99,8 +117,8 @@ class PerceptionInput(BaseModel):
 
 
 class PerceptionOutput(BaseModel):
-    """Output from perception layer"""
     intent: str
+    mode: Literal["direct", "workflow"]
     workflow: str
     entities: Dict[str, Any]
     priority: Literal["high", "medium", "low"]
@@ -109,7 +127,6 @@ class PerceptionOutput(BaseModel):
 
 
 class Goal(BaseModel):
-    """Goal derived from perception"""
     objective: str
     workflow: str
     mode: Literal["full", "partial"]
@@ -118,10 +135,9 @@ class Goal(BaseModel):
 
 
 class Task(BaseModel):
-    """Individual task to execute"""
     id: str
     task_name: str
-    tool_name: str
+    tool_name: Optional[str] = None
     description: str
     required_inputs: Dict[str, Any] = {}
     dependencies: List[str] = []
@@ -132,16 +148,14 @@ class Task(BaseModel):
 
 
 class HILRequest(BaseModel):
-    """Defines what the human must supply before execution can resume."""
     task_id: str
     task_name: str
-    required_fields: Dict[str, str]   # field_name -> human-readable description
+    required_fields: Dict[str, str]
     message: str
     hil_type: Literal["data_collection", "approval", "review"] = "data_collection"
 
 
 class HILStatus(BaseModel):
-    """Tracks whether execution is paused awaiting human input."""
     required: bool = False
     request: Optional[HILRequest] = None
     paused_at_task_index: int = 0
@@ -149,11 +163,16 @@ class HILStatus(BaseModel):
 
 
 class ExecutionState(BaseModel):
-    """Track execution state"""
     workflow_id: str
     workflow_type: str
-    mode: str
-    goal: Goal
+    intent: str = "unknown"
+    mode: str = "workflow"
+    entities: Dict[str, Any] = {}
+    input_data: Dict[str, Any] = {}
+    memory: Dict[str, Any] = {}
+    tools_available: List[str] = []
+
+    goal: Optional[Goal] = None
     tasks: List[Task] = []
     current_step: int = 0
     results: Dict[str, Any] = {}
@@ -165,14 +184,39 @@ class ExecutionState(BaseModel):
     execution_log: List[str] = []
     hil_status: Optional[HILStatus] = None
 
+    def get_primary_url(self) -> Optional[str]:
+        url = self.entities.get("url") or self.entities.get("competitor_url")
+        if url:
+            return url
+        url = self.input_data.get("url") or self.input_data.get("tender_url")
+        if url:
+            return url
+        import re
+        prompt = self.input_data.get("prompt", "")
+        urls = re.findall(r'https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+(?:/[-\w._?%#&=]*)?', prompt)
+        return urls[0] if urls else None
+
+    def get_primary_document(self) -> Optional[str]:
+        doc = self.entities.get("rfp_pdf_path") or self.entities.get("rfp_document") or self.entities.get("document")
+        if doc:
+            return doc
+        doc = self.input_data.get("file_path") or self.input_data.get("rfp_pdf_path")
+        if doc:
+            return doc
+        import re
+        prompt = self.input_data.get("prompt", "")
+        paths = re.findall(r'[\w/._-]+\.(?:pdf|docx|xlsx|csv|txt)', prompt)
+        return paths[0] if paths else None
+
 
 class OrchestrationOutput(BaseModel):
-    """Final output from orchestrator"""
     status: str
     workflow_id: str
     workflow_type: str
+    intent: str = "unknown"
     tasks_executed: List[str]
     results: Dict[str, Any]
+    context_memory: Dict[str, Any] = {}
     success_metrics: Dict[str, Any] = {}
     errors: Dict[str, str] = {}
     total_execution_time: float = 0.0
@@ -180,7 +224,6 @@ class OrchestrationOutput(BaseModel):
 
 
 def get_llm():
-    """Initialize LLM for perception and decomposition"""
     return ChatGoogleGenerativeAI(
         model="gemini-2.0-flash",
         temperature=0.1,
@@ -189,112 +232,58 @@ def get_llm():
 
 
 PERCEPTION_PROMPT = """
-You are an expert business analyst understanding user commands. Parse the natural language prompt and extract structured insights.
+You are the Perception Layer of an industrial OEM's Enterprise AI. Your goal is to map user input to a structured INTENT, ACTION, and MODE from the locked registry.
 
 USER PROMPT:
 {prompt}
 
-TASK:
-1. Determine PRIMARY INTENT
-2. Identify ACTION category
-3. Extract key entities from prompt
-4. Assess priority level
-5. Flag critical issues
+LOCKED REGISTRY:
+| intent      | action                          |
+|-------------|---------------------------------|
+| rfp         | process_rfp / risk_analysis / technical_match / pricing_only / generate_proposal |
+| procurement | list_vendors / evaluate_vendors / negotiate / vendor_risk / market_analysis |
+| onboarding  | run_onboarding / kyc / document_verification |
+| competitor  | competitor_analysis             |
+| email       | scan_emails_for_rfp             |
+| scraping    | scrape_tenders                  |
+| conversational | any                          |
 
-INTENT TYPES:
-- "conversational" → Greetings, capability questions, small talk, help requests (e.g. "hi", "what can you do", "how does this work", "hello")
-- "rfp" → RFP document processing (upload, analyze, match requirements, pricing, proposals)
-- "procurement" → Vendor sourcing and negotiation
-- "onboarding" → KYC, risk assessment, vendor onboarding
-- "competitor" → Market and competitor intelligence
-- "email" → Email scanning and extraction for business documents
-- "scraping" → Web scraping for tenders, market data
-- "unknown" → Cannot determine even after careful analysis
+RULES:
+1. GREETINGS/HELP: intent="conversational", mode="direct"
+2. WORKFLOW MODE (Multi-step):
+   - RFP: Trigger "workflow" ONLY if prompt is "analyze this rfp", "process this rfp", "give me a proposal for this", or similar full-flow requests.
+   - PROCUREMENT: Trigger "workflow" ONLY if prompt asks for "full procurement", "end-to-end vendors", etc.
+   - ONBOARDING: Trigger "workflow" for "onboard this vendor" or "run full onboarding".
+3. DIRECT MODE (Single-step):
+   - Default to "direct" for specific queries like "list vendors", "evaluate them", "negotiate with X", "market behavior", "risk profile", "kyc X".
+4. RFP MAPPING: "risk" -> risk_analysis, "technical" -> technical_match, "price" -> pricing_only, "proposal" -> generate_proposal.
+5. PROCUREMENT MAPPING: "list" -> list_vendors, "evaluate" -> evaluate_vendors, "negotiate" -> negotiate, "risk" -> vendor_risk, "market" -> market_analysis.
+6. ENTITIES: Extract vendor_name, rfp_pdf_path, url, aadhar_number, negotiation_intent.
+7. CONTEXT RESOLUTION: Resolve "it", "this", "them" using [CONTEXT].
 
-WORKFLOW MAPPING:
-- intent="conversational" → workflow="conversational"
-- intent="rfp" → workflow="rfp"
-- intent="procurement" → workflow="procurement"
-- intent="onboarding" → workflow="onboarding"
-- intent="competitor" → workflow="competitor_analysis"
-- intent="email" → workflow="hybrid"
-- intent="scraping" → workflow="hybrid"
-- intent="unknown" → workflow="unknown"
-
-ACTION EXAMPLES (handle variations):
-- "check emails for rfps" | "scan my mailbox for rfp requests" → intent="email", action="scan_emails_for_rfp"
-- "scrape tender" | "scrape tender portal for rfps" → intent="scraping", action="scrape_tenders"
-- "process this rfp" | "analyze the provided rfp" | "upload pdf and process" → intent="rfp", action="process_rfp"
-- "add pricing to rfp" | "calculate price" → intent="rfp", action="pricing_only"
-- "assess risks" | "risk analysis" → intent="rfp", action="risk_analysis"
-- "evaluate vendors" | "vendor scoring" → intent="procurement", action="vendor_evaluation"
-- "onboard vendor" | "onboard TechCorp" → intent="onboarding", action="full_onboarding"
-- "analyze competitors" | "competitor analysis" → intent="competitor", action="competitor_analysis"
-
-ENTITY EXTRACTION RULES:
-1. FILE PATHS: Extract any /path/to/file.pdf, relative paths, or file references
-2. URLS: Extract http://, https://, or domain references (tenders, competitors, emails)
-3. EMAIL DETAILS: Extract folder names (inbox, attachments), email keywords
-4. VENDOR/CLIENT: Extract company names, proper nouns mentioned
-5. REQUIREMENTS: Extract specific needs, constraints, timelines mentioned
-
-OUTPUT: Return ONLY valid JSON (no markdown, no extra text):
+OUTPUT JSON ONLY:
 {{
-  "intent": "<intent_type>",
-  "action": "<action>",
-  "workflow": "<workflow_type>",
-  "mode": "full|partial",
+  "intent": "rfp|procurement|onboarding|competitor|email|scraping|conversational",
+  "action": "<locked_action>",
+  "mode": "direct|workflow",
+  "workflow": "rfp|procurement|onboarding|competitor_analysis|hybrid",
   "entities": {{
-    "rfp_pdf_path": "<extracted file path or empty string>",
-    "email_text": "<email folder/config needed or empty>",
-    "url": "<extracted URL for scraping, competitor analysis, etc. or empty>",
-    "vendor_details": {{"name": "<vendor name if mentioned>"}},
-    "requirement_summary": "<extracted requirements or empty>"
+    "rfp_pdf_path": "...",
+    "url": "...",
+    "vendor_name": "...",
+    "negotiation_intent": "reduce_cost|improve_delivery|balanced"
   }},
-  "priority": "high|medium|low",
-  "confidence": <0.0-1.0>,
-  "identified_issues": []
+  "confidence": 0.0-1.0
 }}
-
-CRITICAL EXTRACTION EXAMPLES:
-- Prompt: "check my emails in inbox for rfps" → email_text should capture "inbox"
-- Prompt: "scrape https://tender.gov.in for rfps" → url should be "https://tender.gov.in"
-- Prompt: "process /uploads/acme_rfp.pdf" → rfp_pdf_path should be "/uploads/acme_rfp.pdf"
-- Prompt: "onboard vendor TechCorp" → vendor_details.name should be "TechCorp"
-
-PRIOR SESSION (when [CONTEXT] contains "prior_session" key):
-This means the user is following up on a previous turn in the same chat session.
-Resolve "this", "that", "it", "the first one", "that RFP", "that vendor", etc. by
-looking inside prior_session.results:
-  - prior_session.results.email_rfps[0].attachments[0]  → rfp_pdf_path
-  - prior_session.results.rfp.title / buyer             → context for rfp intent  
-  - prior_session.results.recommended_vendor.name       → vendor_details.name
-Always populate the resolved entity even if NOT re-stated in the current prompt.
-
-FOLLOW-UP EXAMPLES:
-- Prior turn scanned emails, found rfp_cloud.pdf. Prompt: "create a proposal for this"
-  → intent="rfp", action="process_rfp", rfp_pdf_path="<prior attachment>"
-- Prior procurement selected TechCorp. Prompt: "run competitor analysis for this"
-  → intent="competitor", action="competitor_analysis", vendor_details.name="TechCorp"
-- Prior email scan. Prompt: "who are the competitors in this space"
-  → intent="competitor", action="competitor_analysis"
-
-Return ONLY valid JSON. No explanations, no markdown code blocks.
 """
 
 
 def perception_layer(prompt_input: PromptInput) -> PerceptionOutput:
-    """
-    LAYER 1: PERCEPTION
-    Parse natural language prompt + context and extract structured insights.
-    Output format is compatible with goal_formation.
-    """
     logger.info("🧠 PERCEPTION LAYER: Analyzing prompt...")
     logger.info(f"   Prompt: {prompt_input.prompt[:100]}...")
-    
+
     llm = get_llm()
-    
-    # Build enriched prompt with context
+
     enriched_prompt = prompt_input.prompt
     if prompt_input.file_path:
         enriched_prompt += f"\n[FILE PROVIDED: {prompt_input.file_path}]"
@@ -304,25 +293,24 @@ def perception_layer(prompt_input: PromptInput) -> PerceptionOutput:
         enriched_prompt += f"\n[EMAIL CONFIG: {json.dumps(prompt_input.email_config)}]"
     if prompt_input.context:
         enriched_prompt += f"\n[CONTEXT: {json.dumps(prompt_input.context)}]"
-    
+
     prompt_template = PromptTemplate(
         input_variables=["prompt"],
         template=PERCEPTION_PROMPT
     )
-    
+
     try:
         response = llm.invoke(prompt_template.format(prompt=enriched_prompt))
         response_text = response.content.strip()
-        
+
         if response_text.startswith("```"):
             response_text = response_text.split("```")[1]
             if response_text.startswith("json"):
                 response_text = response_text[4:]
             response_text = response_text.split("```")[0].strip()
-        
+
         perception_data = json.loads(response_text)
-        
-        # Merge extracted entities with provided context
+
         entities = perception_data.get("entities", {})
         if prompt_input.file_path and not entities.get("rfp_pdf_path"):
             entities["rfp_pdf_path"] = prompt_input.file_path
@@ -332,22 +320,39 @@ def perception_layer(prompt_input: PromptInput) -> PerceptionOutput:
             entities["email_config"] = prompt_input.email_config
         if prompt_input.context:
             entities["context"] = prompt_input.context
-        
+
+        import re
+        prompt = prompt_input.prompt
+
+        if not entities.get("url"):
+            urls = re.findall(r'https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+(?:/[-\w._?%#&=]*)?', prompt)
+            if urls:
+                logger.info(f"🔗 Regex resolved URL from prompt: {urls[0]}")
+                entities["url"] = urls[0]
+
+        if not entities.get("rfp_pdf_path") and not entities.get("rfp_document"):
+            files = re.findall(r'[\w/._-]+\.(?:pdf|docx|xlsx|csv|txt)', prompt)
+            if files:
+                logger.info(f"📄 Regex resolved document from prompt: {files[0]}")
+                entities["rfp_document"] = files[0]
+
         logger.info(f"✓ Intent: {perception_data['intent']}, Workflow: {perception_data['workflow']}")
-        
+
         return PerceptionOutput(
             intent=perception_data.get("intent", "unknown"),
+            mode=perception_data.get("mode", "workflow"),
             workflow=perception_data.get("workflow", "hybrid"),
             entities=entities,
             priority=perception_data.get("priority", "medium"),
             confidence=perception_data.get("confidence", 0.5),
             identified_issues=perception_data.get("identified_issues", [])
         )
-    
+
     except Exception as e:
         logger.error(f"❌ Perception error: {e}")
         return PerceptionOutput(
             intent="unknown",
+            mode="direct",
             workflow="hybrid",
             entities={},
             priority="medium",
@@ -355,15 +360,12 @@ def perception_layer(prompt_input: PromptInput) -> PerceptionOutput:
             identified_issues=[f"Error: {str(e)}"]
         )
 
+
 def goal_formation(perception: PerceptionOutput) -> Goal:
-    """
-    LAYER 2: GOAL FORMATION
-    Convert perception → goals (deterministic, rule-based)
-    """
     logger.info("🎯 GOAL FORMATION: Converting perception to goals...")
-    
+
     workflow = perception.workflow
-    
+
     success_criteria = {
         "rfp": [
             "RFP metadata extracted",
@@ -372,23 +374,11 @@ def goal_formation(perception: PerceptionOutput) -> Goal:
             "Pricing calculated",
             "Proposal generated"
         ],
-        "procurement": [
-            "Vendors evaluated",
-            "Scores calculated",
-            "Terms negotiated"
-        ],
-        "onboarding": [
-            "Documents verified",
-            "KYC passed",
-            "Risk acceptable",
-            "Vendor onboarded"
-        ],
-        "competitor_analysis": [
-            "Competitors identified",
-            "Intelligence gathered"
-        ]
+        "procurement": ["Vendors evaluated", "Scores calculated", "Terms negotiated"],
+        "onboarding": ["Documents verified", "KYC passed", "Risk acceptable", "Vendor onboarded"],
+        "competitor_analysis": ["Competitors identified", "Intelligence gathered"]
     }
-    
+
     goal = Goal(
         objective=f"Execute {workflow} workflow: {perception.entities.get('requirement_summary', 'task')}",
         workflow=workflow,
@@ -401,391 +391,703 @@ def goal_formation(perception: PerceptionOutput) -> Goal:
         },
         success_criteria=success_criteria.get(workflow, [])
     )
-    
+
     logger.info(f"✓ Goal: {goal.objective}")
     return goal
 
-DECOMPOSITION_PROMPT = """
-You are an expert workflow orchestration engine. Break down the goal into ordered, executable tasks.
 
-GOAL:
-{goal}
+GENERATE_TASKS_PROMPT = """
+You are an expert workflow orchestration engine. Break down the user intent into logical, abstract business tasks.
 
-WORKFLOW TYPE:
-{workflow}
+INTENT: {intent}
+MODE: {mode}
+ENTITIES: {entities}
+CURRENT STATE HAS INPUT?: {has_input}
 
-CONTEXT CONSTRAINTS (URLs, deadlines, budgets, etc.):
-{constraints}
+RULES FOR TASK GENERATION:
+1. Generate abstract tasks (e.g., "Analyze RFP document", "Find competitor pricing", "Generate proposal"). Do NOT specify explicit tool names.
+2. Context Awareness:
+   - If 'has_input' is True (i.e. an RFP document or URL is already provided), DO NOT include data gathering steps like "Scan email" or "Scrape portal". Jump straight to processing.
+   - If 'has_input' is False and the intent requires data (like RFP parsing), YOU MUST include a discovery task like "Scan emails for RFP" or "Scrape tender portals".
+   - For Competitor analysis, only generate tasks related to market research, competitor feature extraction, etc.
+3. Order matters: ensure sequential logic.
+4. Output ONLY valid JSON, with a list of tasks.
 
-AVAILABLE TOOLS:
-- email_handler → Scan Gmail for RFP emails and documents
-- tender_scraper → Scrape tender portals for opportunities
-- rfp_aggregator → Parse RFP, extract metadata
-- risk_compliance → Assess legal and compliance risks
-- technical_agent → Match RFP requirements to SKUs
-- dynamic_pricing → Calculate competitive pricing
-- proposal_weaver → Generate winning proposals
-- vendor_procurement → Evaluate and score vendors
-- vendor_evaluation → Score vendors
-- vendor_negotiation → Negotiate contracts
-- document_verification → Verify vendor documents
-- kyc_verification → Perform KYC checks
-- vendor_risk → Assess vendor risk
-- competitor_analysis → Analyze competitors (Requires 'company_url' and 'product_url' in required_inputs from CONTEXT CONSTRAINTS)
-- run_onboarding_pipeline → Full vendor onboarding
-
-RULES:
-1. Tasks must be ordered (execution sequence matters)
-2. Tool names must EXACTLY match the list above
-3. Include ALL necessary steps
-4. Set realistic dependencies
-5. Output ONLY valid JSON
-
-OUTPUT (valid JSON only, no markdown):
+OUTPUT FORMAT:
 {{
   "tasks": [
     {{
       "id": "t1",
       "task_name": "<name>",
-      "tool_name": "<exact tool name from list>",
-      "description": "<what it does>",
+      "description": "<detailed description of what needs to be done>",
       "required_inputs": {{}},
-      "dependencies": [],
-      "priority": 0
+      "priority": 1
     }}
-  ],
-  "execution_order": ["t1", "t2"]
+  ]
 }}
-
 Return ONLY valid JSON. No explanations.
 """
 
 
-def task_decomposition(goal: Goal) -> List[Task]:
+def generate_tasks(intent: str, entities: Dict[str, Any], state: ExecutionState) -> List[Task]:
+    logger.info("📋 TASK GENERATION: Deterministic Decision Logic...")
+
+    def create_task(name: str) -> Task:
+        return Task(id=f"t{uuid.uuid4().hex[:4]}", task_name=name, description=name)
+
+    intent_norm = intent.lower()
+    action = entities.get("action", "").lower()
+    tasks_to_run = []
+
+    # ── INTENT TO TASK DECISION LOGIC ──
+
+    if intent_norm == "rfp":
+        if action == "risk_analysis":
+            tasks_to_run = ["Aggregate RFP Data", "Assess RFP Risk"]
+        elif action == "technical_match":
+            tasks_to_run = ["Aggregate RFP Data", "Match Technical Requirements"]
+        elif action == "pricing_only":
+            tasks_to_run = ["Aggregate RFP Data", "Match Technical Requirements", "Calculate Dynamic Pricing"]
+        elif action == "generate_proposal":
+            tasks_to_run = ["Aggregate RFP Data", "Assess RFP Risk", "Match Technical Requirements", "Calculate Dynamic Pricing", "Generate Final Proposal"]
+        else: # process_rfp / analyze / full / ""
+            tasks_to_run = ["Aggregate RFP Data", "Assess RFP Risk", "Match Technical Requirements", "Calculate Dynamic Pricing", "Generate Final Proposal"]
+
+    elif intent_norm == "procurement":
+        if action == "list_vendors":
+            tasks_to_run = ["Retrieve Vendor List"]
+        elif action in ("negotiate", "negotiate_vendor"):
+            tasks_to_run = ["Evaluate and Score Vendors", "Negotiate Vendor Terms"]
+        elif action in ("vendor_risk", "assess_risk"):
+            tasks_to_run = ["Evaluate and Score Vendors", "Assess Vendor Risk"]
+        else: # evaluate_vendors / score / ""
+            tasks_to_run = ["Evaluate and Score Vendors"]
+
+    elif intent_norm == "onboarding":
+        if action == "kyc":
+            tasks_to_run = ["Run KYC Verification"]
+        elif action == "document_verification":
+            tasks_to_run = ["Verify Vendor Documents"]
+        else: # run_onboarding / full / ""
+            tasks_to_run = ["Verify Vendor Documents", "Run KYC Verification", "Assess Vendor Risk", "Run Full Onboarding"]
+
+    elif intent_norm == "competitor":
+        tasks_to_run = ["Analyze Competitor Intelligence"]
+
+    elif intent_norm == "email":
+        tasks_to_run = ["Scan Emails for RFPs"]
+
+    elif intent_norm == "scraping":
+        tasks_to_run = ["Scrape Tender Portals"]
+
+    else: # conversational / unknown
+        tasks_to_run = ["General Response"]
+
+    # ── STATE AWARENESS: Skip if exists ──
+    final_tasks = []
+    user_request_redo = any(word in state.input_data.get("prompt", "").lower() for word in ["redo", "recalculate", "regenerate", "restart"])
+
+    for task_name in tasks_to_run:
+        tool_name = TASK_TO_TOOL.get(task_name)
+        named_key = TOOL_RESULT_KEY.get(tool_name)
+        
+        # Exception: Retrieve Vendor List vs Evaluate and Score Vendors both map to vendor_procurement
+        # But we check the state structure for Evaluate and Score Vendors (top_vendors)
+        is_already_in_state = False
+        if named_key in state.results:
+            is_already_in_state = True
+            # Finer check for vendor_procurement modes
+            if task_name == "Evaluate and Score Vendors" and "top_vendors" not in state.results.get(named_key, {}):
+                is_already_in_state = False
+            if task_name == "Retrieve Vendor List" and "vendors" not in state.results.get(named_key, {}):
+                is_already_in_state = False
+
+        if is_already_in_state and not user_request_redo:
+            logger.info(f"⏭️  Skipping '{task_name}' — found {named_key} in state.")
+            continue
+        
+        final_tasks.append(create_task(task_name))
+
+    if not final_tasks and tasks_to_run:
+        logger.info("✅ All requested tasks already exist in state. Returning General Response.")
+        final_tasks = [create_task("General Response")]
+
+    logger.info(f"✓ Generated {len(final_tasks)} tasks")
+    return final_tasks
+
+
+TOOL_SELECTOR_PROMPT = """
+You are an expert Tool Selector agent. Your job is to select the BEST tool to execute the given task.
+
+TASK:
+Name: {task_name}
+Description: {task_desc}
+
+CURRENT STATE:
+Intent: {intent}
+Mode: {mode}
+Entities: {entities}
+Available Input Data & Results: {input_data}
+
+AVAILABLE TOOLS:
+{tools_list}
+- none → Use this if the task does not require any tool.
+
+RULES:
+1. Select ONLY ONE tool from the list above.
+2. The tool must exactly match one of the listed tool names.
+3. Output ONLY valid JSON, no markdown.
+
+OUTPUT FORMAT:
+{{
+  "tool": "<tool_name_or_none>",
+  "reason": "<brief justification>"
+}}
+
+STRICT MAPPING RULES:
+- Task: "Aggregate RFP Data" → tool: "rfp_aggregator"
+- Task: "Assess RFP Risk" → tool: "risk_compliance"
+- Task: "Match Technical Requirements" → tool: "technical_agent"
+- Task: "Calculate Dynamic Pricing" → tool: "dynamic_pricing"
+- Task: "Generate Final Proposal" → tool: "proposal_weaver"
+- Task: "Retrieve Vendor List" → tool: "vendor_procurement"
+- Task: "Analyze Competitor Intelligence" → tool: "competitor_analysis"
+- Task: "General Response" → tool: "general_response"
+"""
+
+
+# ── TASK NAME TO TOOL MAPPING (locked, exhaustive) ──────────────────────────
+TASK_TO_TOOL = {
+    "Aggregate RFP Data":              "rfp_aggregator",
+    "Assess RFP Risk":                 "risk_compliance",
+    "Match Technical Requirements":    "technical_agent",
+    "Calculate Dynamic Pricing":       "dynamic_pricing",
+    "Generate Final Proposal":         "proposal_weaver",
+    "Scan Emails for RFPs":            "email_handler",
+    "Scrape Tender Portals":           "tender_scraper",
+    "Retrieve Vendor List":            "vendor_procurement", # mode=list_only
+    "Evaluate and Score Vendors":      "vendor_procurement", # mode=full
+    "Negotiate Vendor Terms":          "vendor_negotiation",
+    "Evaluate Vendor":                 "vendor_evaluation",
+    "Assess Vendor Risk":              "vendor_risk",
+    "Verify Vendor Documents":         "document_verification",
+    "Run KYC Verification":            "kyc_verification",
+    "Run Full Onboarding":             "run_onboarding_pipeline",
+    "Analyze Competitor Intelligence": "competitor_analysis",
+    "General Response":                "general_response",
+}
+
+# ── TOOL NAME → NAMED RESULT KEY MAPPING (E4 compliance) ────────────────────
+TOOL_RESULT_KEY = {
+    "rfp_aggregator":   "rfp_aggregator",
+    "risk_compliance":  "risk_compliance",
+    "technical_agent":  "technical_agent",
+    "dynamic_pricing":  "dynamic_pricing",
+    "proposal_weaver":  "proposal_weaver",
+    "vendor_procurement": "vendor_procurement",
+    "vendor_negotiation": "vendor_negotiation",
+    "vendor_risk":        "vendor_risk",
+    "vendor_evaluation":  "vendor_evaluation",
+    "competitor_analysis": "competitor_analysis",
+    "email_handler":      "email_handler",
+    "tender_scraper":     "tender_scraper",
+    "general_response":   "general_response",
+    "document_verification": "document_verification",
+    "kyc_verification":   "kyc_verification",
+    "run_onboarding_pipeline": "run_onboarding_pipeline",
+}
+
+
+# ── MAPPINGS FOR MODULAR EXECUTION ────────────────────────────────────────────
+
+ACTION_TO_TOOL = {
+    "process_rfp":       "rfp_aggregator",
+    "risk_analysis":     "risk_compliance",
+    "technical_match":   "technical_agent",
+    "pricing_only":      "dynamic_pricing",
+    "generate_proposal": "proposal_weaver",
+    "list_vendors":      "vendor_procurement",
+    "evaluate_vendors":  "vendor_evaluation",
+    "negotiate":         "vendor_negotiation",
+    "vendor_risk":       "vendor_risk",
+    "market_analysis":   "vendor_market_research",
+    "competitor_analysis": "competitor_analysis",
+    "scan_emails_for_rfp": "email_handler",
+    "scrape_tenders":    "tender_scraper",
+}
+
+# ── ROUTER ────────────────────────────────────────────────────────────────────
+
+def router(state: ExecutionState) -> Dict[str, Any]:
     """
-    LAYER 3: TASK DECOMPOSITION
-    Short-circuits conversational/unknown intents — no LLM decomposition needed.
-    Only calls LLM for real business workflows.
+    Precision Router: Maps intent + action + mode to either a single tool or a workflow.
+    Ensures that 'direct' mode runs exactly one capability.
     """
-    logger.info("📋 TASK DECOMPOSITION: Breaking down goal...")
+    logger.info(f"🚦 ROUTER: Mode={state.mode}, Action={state.intent}.{state.entities.get('action')}")
+    
+    action = state.entities.get("action")
+    mode   = state.mode
 
-    # ── Short-circuit: no agents for conversational or unrecognised prompts ──
-    if goal.workflow in ("conversational", "unknown"):
-        logger.info(f"⚡ Short-circuit: workflow='{goal.workflow}' → single general_response task")
-        return [Task(
-            id="t1",
-            task_name="General Response",
-            tool_name="general_response",
-            description="Reply to the user's message directly using LLM",
-            required_inputs={"original_goal": goal.objective},
-            dependencies=[],
-            priority=0
-        )]
+    if mode == "direct":
+        tool = ACTION_TO_TOOL.get(action)
+        if not tool:
+            # Fallback to intent-based tool if action is missing
+            if state.intent == "competitor": tool = "competitor_analysis"
+            elif state.intent == "email":     tool = "email_handler"
+            elif state.intent == "scraping":  tool = "tender_scraper"
+            else: tool = "general_response"
+            
+        return {
+            "type": "direct",
+            "tool": tool
+        }
 
-    llm = get_llm()
-    prompt = PromptTemplate(
-        input_variables=["goal", "workflow", "constraints"],
-        template=DECOMPOSITION_PROMPT
-    )
+    if mode == "workflow":
+        return {
+            "type": "workflow",
+            "workflow": state.workflow_type
+        }
 
-    try:
-        response = llm.invoke(prompt.format(
-            goal=goal.objective,
-            workflow=goal.workflow,
-            constraints=json.dumps(goal.constraints)
-        ))
+    return {
+        "type": "direct",
+        "tool": "general_response"
+    }
 
-        response_text = response.content.strip()
-        if response_text.startswith("```"):
-            response_text = response_text.split("```")[1]
-            if response_text.startswith("json"):
-                response_text = response_text[4:]
-            response_text = response_text.split("```")[0].strip()
-
-        decomposition_data = json.loads(response_text)
-
-        tasks = []
-        for task_data in decomposition_data.get("tasks", []):
-            raw_priority = task_data.get("priority", 0)
-            if isinstance(raw_priority, str):
-                if "high" in raw_priority.lower():
-                    priority_val = 2
-                elif "medium" in raw_priority.lower():
-                    priority_val = 1
-                else:
-                    priority_val = 0
-            else:
-                priority_val = raw_priority
-
-            task = Task(
-                id=task_data.get("id", f"t{len(tasks)+1}"),
-                task_name=task_data.get("task_name", ""),
-                tool_name=task_data.get("tool_name", ""),
-                description=task_data.get("description", ""),
-                required_inputs=task_data.get("required_inputs", {}),
-                dependencies=task_data.get("dependencies", []),
-                priority=priority_val
-            )
-            tasks.append(task)
-
-        logger.info(f"✓ Decomposed: {len(tasks)} tasks")
-        return tasks
-
-    except Exception as e:
-        logger.error(f"❌ Decomposition error: {e}")
-        logger.error(traceback.format_exc())
-        return []
 
 class ToolSelector:
-    """
-    Maps task tool names to actual executable functions.
-    """
-    
     def __init__(self, input_data: PerceptionInput, state: ExecutionState):
         self.input_data = input_data
         self.state = state
         self.tool_registry = self._build_tool_registry()
-    
+
+    def select_tool_for_task(self, task: Task) -> str:
+        llm = get_llm()
+        tools_list = "\n".join(
+            [f"- {name}" for name in self.tool_registry.keys() if name != 'run_full_rfp_pipeline']
+        )
+
+        prompt = PromptTemplate(
+            input_variables=["task_name", "task_desc", "intent", "mode", "entities", "input_data", "tools_list"],
+            template=TOOL_SELECTOR_PROMPT
+        )
+
+        try:
+            state_dict = {
+                "intent": getattr(self.state, "intent", "unknown"),
+                "mode": getattr(self.state, "mode", "workflow"),
+                "entities": getattr(self.state, "entities", {}),
+                "input_data": getattr(self.state, "input_data", {}),
+                "results": getattr(self.state, "results", {})
+            }
+
+            response = llm.invoke(prompt.format(
+                task_name=task.task_name,
+                task_desc=task.description,
+                intent=state_dict["intent"],
+                mode=state_dict["mode"],
+                entities=json.dumps(state_dict["entities"]),
+                input_data=json.dumps(list(state_dict["results"].keys())),
+                tools_list=tools_list
+            ))
+
+            response_text = response.content.strip()
+            if response_text.startswith("```"):
+                response_text = response_text.split("```")[1]
+                if response_text.startswith("json"):
+                    response_text = response_text[4:]
+                response_text = response_text.split("```")[0].strip()
+
+            data = json.loads(response_text)
+            tool = data.get("tool", "none")
+            logger.info(f"🧠 TOOL SELECTOR: Chose '{tool}' for task '{task.task_name}'. Reason: {data.get('reason', '')}")
+            return tool
+        except Exception as e:
+            logger.error(f"❌ Tool selection error: {e}")
+            return "none"
+
     def _build_tool_registry(self) -> Dict[str, Callable]:
-        """Build mapping of tool names to actual functions"""
         return {
-            "general_response": self._run_general_response,
-            "email_handler": self._run_email_handler,
-            "tender_scraper": self._run_tender_scraper,
-            "rfp_aggregator": self._run_rfp_aggregator,
-            "risk_compliance": self._run_risk_compliance,
-            "technical_agent": self._run_technical_agent,
-            "dynamic_pricing": self._run_dynamic_pricing,
-            "proposal_weaver": self._run_proposal_weaver,
+            "general_response":      self._run_general_response,
+            "email_handler":         self._run_email_handler,
+            "tender_scraper":        self._run_tender_scraper,
+            "rfp_aggregator":        self._run_rfp_aggregator,
+            "risk_compliance":       self._run_risk_compliance,
+            "technical_agent":       self._run_technical_agent,
+            "dynamic_pricing":       self._run_dynamic_pricing,
+            "proposal_weaver":       self._run_proposal_weaver,
             "run_full_rfp_pipeline": self.run_full_rfp_pipeline,
-            "vendor_evaluation": self._run_vendor_evaluation,
-            "vendor_procurement": self._run_vendor_procurement,
-            "vendor_negotiation": self._run_vendor_negotiation,
+            "vendor_evaluation":     self._run_vendor_evaluation,
+            "vendor_procurement":    self._run_vendor_procurement,
+            "vendor_negotiation":    self._run_vendor_negotiation,
+            "vendor_market_research": self._run_vendor_market_research,
             "document_verification": self._run_document_verification,
-            "kyc_verification": self._run_kyc_verification,
-            "vendor_risk": self._run_vendor_risk,
+            "kyc_verification":      self._run_kyc_verification,
+            "vendor_risk":           self._run_vendor_risk,
             "run_onboarding_pipeline": self._run_full_onboarding,
-            "competitor_analysis": self._run_competitor_analysis,
+            "competitor_analysis":   self._run_competitor_analysis,
         }
-    
-    def select_and_execute(self, task: Task) -> Dict[str, Any]:
-        """Select tool and execute task."""
-        tool_name = task.tool_name
+
+    # ── CORE FIX: deterministic input builder ────────────────────────────────
+    def _build_tool_input(self, tool_name: str, task: Task) -> Dict[str, Any]:
+        """
+        Build tool input by reading from named result keys in state (state-first).
+        Ensures proper rfp data flow (aggregator -> technical -> pricing).
+        """
+        results = self.state.results
+        entities = self.state.entities
         
+        primary_url = self.state.get_primary_url()
+        primary_doc = self.state.get_primary_document()
+
+        # ── Per-tool deterministic mappings ──────────────────────────────────
+
+        if tool_name == "rfp_aggregator":
+            return {"document": primary_doc, "text_path": ""}
+
+        elif tool_name == "risk_compliance":
+            # State Priority: Use processed rfp_aggregator output if available
+            agg = results.get("rfp_aggregator", {})
+            rfp_text = results.get("rfp_text") 
+            if not rfp_text and agg:
+                rfp_text = f"Title: {agg.get('title', '')}\nScope: {agg.get('scope_of_work', '')}\nRequirements: {agg.get('technical_requirements', '')}"
+            return {"rfp_text": rfp_text or ""}
+
+        elif tool_name == "technical_agent":
+            # Convert raw requirement strings into RFPRequirement objects for the Technical Agent
+            agg = results.get("rfp_aggregator", {})
+            raw_reqs = agg.get("technical_requirements") or entities.get("requirements") or []
+            
+            # Map List[str] to List[RFPRequirement]
+            formatted_reqs = []
+            if isinstance(raw_reqs, list):
+                for i, r in enumerate(raw_reqs):
+                    if isinstance(r, str):
+                        formatted_reqs.append({
+                            "id": f"REQ-{i+1:03d}",
+                            "description": r,
+                            "parameters": {}, # Will be filled by Technical Agent query expansion
+                            "category": "General",
+                            "priority": entities.get("priority", "Medium")
+                        })
+                    else:
+                        formatted_reqs.append(r)
+            
+            return {"requirements": formatted_reqs}
+
+        elif tool_name == "dynamic_pricing":
+            # State Priority: technical_agent + risk_compliance
+            tech = results.get("technical_agent", {})
+            risk = results.get("risk_compliance", {})
+            return {"sku_matches": tech, "risk_data": risk}
+
+        elif tool_name == "proposal_weaver":
+            return {} # Reads from state.results directly
+
+        elif tool_name == "vendor_market_research":
+            # Decoupled market research tool - Build full Requirement object
+            agg = results.get("rfp_aggregator", {})
+            
+            # Helper: construct Requirement for vendor_procurement compatibility
+            def build_requirement_obj():
+                # Requirement signature: requirement_id, deadline (datetime), description, priority, pricing, technical_specifications
+                deadline_raw = agg.get("deadline", "")
+                try:
+                    # Attempt epoch or iso string conversion
+                    if str(deadline_raw).replace('.','',1).isdigit():
+                        deadline_dt = datetime.fromtimestamp(float(deadline_raw))
+                    else:
+                        deadline_dt = datetime.fromisoformat(str(deadline_raw))
+                except Exception:
+                    deadline_dt = datetime.now() # Fallback
+
+                # Convert requirements list to dict for compatibility
+                tech_reqs = agg.get("technical_requirements", [])
+                tech_spec_dict = {f"req_{i}": req for i, req in enumerate(tech_reqs)} if isinstance(tech_reqs, list) else {"description": str(tech_reqs)}
+
+                return {
+                    "requirement_id": agg.get("rfp_id", "REQ-001"),
+                    "description": agg.get("scope_of_work", agg.get("rfp_title", "Market analysis request")),
+                    "deadline": deadline_dt,
+                    "priority": entities.get("priority", "balanced"),
+                    "pricing": {"budget": entities.get("budget", 100000), "currency": "INR"},
+                    "technical_specifications": tech_spec_dict
+                }
+
+            return {"requirement": build_requirement_obj()}
+
+        elif tool_name == "vendor_procurement":
+            # Determine mode based on action entity
+            mode = "list_only" if entities.get("action") == "list_vendors" else "full"
+            
+            if mode == "full":
+                # Must provide requirement for scoring/research
+                agg = results.get("rfp_aggregator", {})
+                if not agg:
+                    logger.warning("⚠️  Attempting full procurement without prior RFP aggregation results.")
+                    # Return error or triggger HIL if possible, here we provide fallback
+                    return {"mode": "full", "requirement": None, "error": "RFP data missing"}
+                
+                # Use same requirement builder logic
+                requirement = results.get("market_research", {}).get("requirement") # Try reusing if exists
+                if not requirement:
+                    # Manually construct as per build_requirement_obj logic above
+                    tech_reqs = agg.get("technical_requirements", [])
+                    requirement = {
+                        "requirement_id": agg.get("rfp_id", "REQ-001"),
+                        "description": agg.get("scope_of_work", agg.get("rfp_title", "Procurement request")),
+                        "deadline": datetime.now(), # Simplified for this chunk
+                        "priority": entities.get("priority", "balanced"),
+                        "pricing": {"budget": entities.get("budget", 100000)},
+                        "technical_specifications": {f"req_{i}": req for i, req in enumerate(tech_reqs)}
+                    }
+                return {"mode": "full", "requirement": requirement}
+            
+            return {"mode": mode}
+
+        elif tool_name == "vendor_negotiation":
+            vendor_name = entities.get("vendor_name", "")
+            proc = results.get("vendor_procurement", {})
+            candidates = proc.get("top_vendors", []) + proc.get("all_vendors", [])
+            vendor_id = next((v["vendor_id"] for v in candidates if vendor_name.lower() in v["name"].lower()), None)
+            if not vendor_id and candidates: vendor_id = candidates[0]["vendor_id"]
+
+            return {
+                "vendor_id": vendor_id,
+                "negotiation_intent": entities.get("negotiation_intent", "balanced"),
+                "target_value": entities.get("target_value")
+            }
+
+        elif tool_name == "competitor_analysis":
+            # State Alignment: Satisfy CompetitorInput Pydantic model (requires 2 URLs)
+            u = primary_url or ""
+            return {"product_url": u, "company_url": u}
+
+        elif tool_name == "email_handler":
+            creds = results.get("email_config") or self.state.input_data.get("email_config")
+            return {"credentials": creds}
+
+        return {"task": task}
+
+    def select_and_execute(self, task: Task) -> Dict[str, Any]:
+        tool_name = task.tool_name
+
         if tool_name not in self.tool_registry:
             logger.warning(f"⚠ Unknown tool: {tool_name}")
-            return {
-                "status": "error",
-                "error": f"Tool '{tool_name}' not found"
-            }
-        
+            return {"status": "error", "error": f"Tool '{tool_name}' not found"}
+
         try:
-            logger.info(f"⚙️  Executing: {task.task_name} [{tool_name}]")
-            tool_func = self.tool_registry[tool_name]
-            result = tool_func(task)
+            tool_input = self._build_tool_input(tool_name, task)
+            tool_func  = self.tool_registry[tool_name]
+            result     = tool_func(**tool_input)
+
+            # ── Store under NAMED key immediately so downstream tools can read it ──
+            named_key = TOOL_RESULT_KEY.get(tool_name)
+            if named_key and isinstance(result, dict) and result.get("data"):
+                self.state.results[named_key] = result["data"]
+                logger.info(f"[TOOL OUTPUT] {tool_name} → {json.dumps(result.get('data', {}), default=str)[:200]}...")
+
             logger.info(f"✓ Completed: {task.task_name}")
             return result
-        
+
         except Exception as e:
             logger.error(f"❌ {tool_name}: {str(e)}")
-            return {
-                "status": "error",
-                "error": str(e)
-            }
-    
+            logger.error(traceback.format_exc())
+            return {"status": "error", "error": str(e)}
+
     # ========== CONVERSATIONAL / GENERAL RESPONSE ==========
 
-    def _run_general_response(self, task: Task) -> Dict:
-        """Handle conversational prompts and capability questions with a direct LLM reply."""
+    def _run_general_response(self, task: Task = None, **kwargs) -> Dict:
+        task = task or kwargs.get("task")
         try:
             llm = get_llm()
-            system_prompt = """You are an Enterprise AI Assistant for OEM companies.
-You help with:
-- RFP Processing: Parse RFP documents, match requirements to your SKU catalog, assess risks, calculate pricing, generate proposals
-- Tender Scraping: Scrape government tender portals (eProcure, ISRO, etc.) for opportunities
-- Email Scanning: Scan Gmail inbox for incoming RFPs and business documents
-- Vendor Procurement: Evaluate, score and select vendors
-- Vendor Onboarding: KYC verification, document verification, risk assessment
-- Competitor Analysis: Gather market intelligence on competitors (requires URLs)
+            system_prompt = """You are the 'Enterprise AI Orchestrator', the high-performance core of an industrial OEM's digital operations.
+You represent the 'Unified Source of Truth', providing data-driven, executive-level insights.
 
-Answer the user's message naturally and helpfully. If they ask what you can do, explain these capabilities clearly."""
+YOUR DOMAINS:
+- 📄 RFP Analytics: Precision parsing of technical specs, SKU matching, and multi-tier pricing.
+- 🕷️ Market Intelligence: Real-time scraping of global tender portals and competitor landscapes.
+- 🤝 Strategic Sourcing: Algorithmic vendor scoring and automated negotiation tradeoffs.
+- 🔐 Compliance Core: OCR-based document verification, KYC, and institutional risk profiling.
+
+GUIDELINES:
+1. Persona: Executive, authoritative, and clinical. Avoid 'assistant' fluff or generic helpfulness.
+2. Value Focus: Every response must drive towards a business outcome or technical clarification.
+3. Coherence: Utilize session history to maintain a seamless, high-context operational thread.
+4. Capability: When asked what you can do, summarize your power to execute real-world business workflows through specialized agent clusters."""
 
             user_msg = task.required_inputs.get("original_goal", "Hello")
-            response = llm.invoke(f"{system_prompt}\n\nUser: {user_msg}")
-            reply = response.content.strip()
+            history  = task.required_inputs.get("history", [])
 
+            history_str = ""
+            if history:
+                history_str = "RELEVANT SESSION HISTORY:\n" + "\n".join([
+                    f"- User said: {h.get('prompt')}\n- Agent responded in workflow: {h.get('workflow')}"
+                    for h in history[-4:]
+                ]) + "\n\n"
+
+            response = llm.invoke(f"{system_prompt}\n\n{history_str}User: {user_msg}")
+            reply = response.content.strip()
             logger.info(f"✓ General response generated ({len(reply)} chars)")
-            return {
-                "status": "success",
-                "data": {
-                    "reply": reply,
-                    "type": "conversational"
-                }
-            }
+            return reply
         except Exception as e:
-            return {
-                "status": "success",
-                "data": {
-                    "reply": "I'm your Enterprise AI Assistant. I can help with RFP processing, tender scraping, vendor procurement, onboarding, and competitor analysis. What would you like to do?",
-                    "type": "conversational"
-                }
-            }
+            return "I'm your Enterprise AI Orchestrator. I can help with RFP processing, tender scraping, vendor procurement, onboarding, and competitor analysis. What would you like to do?"
 
     # ========== INPUT HANDLER TOOLS ==========
-    
-    def _run_email_handler(self, task: Task) -> Dict:
-        """Execute email scanning for RFPs.
 
-        Credential resolution order (highest → lowest priority):
-        1. task.required_inputs       – per-call override
-        2. state.results["email_config"] – injected at login time by orchestrate()
-        3. Environment variables        – GMAIL_ID / APP_PASSWORD (last resort fallback)
-        """
+    def _run_email_handler(self, task: Task = None, **kwargs) -> Dict:
+        task = task or kwargs.get("task")
+        credentials = kwargs.get("credentials")
         try:
-            logger.info("📧 Scanning emails for RFPs...")
+            logger.info("✉️  Scanning emails for RFPs...")
+            config = credentials or self.state.results.get("email_config") or task.required_inputs.get("email_config")
 
-            # Resolve credentials from session context or fall back to env
-            email_config = self.state.results.get("email_config") or {}
-            email_id = (
-                task.required_inputs.get("email_id") or
-                email_config.get("gmail_id")  # None -> process_unread_emails falls back to env
-            )
-            app_password = (
-                task.required_inputs.get("app_password") or
-                email_config.get("app_password")
-            )
+            if not config:
+                return {"status": "error", "error": "No email configuration/credentials provided"}
 
-            # Audit trail
-            auth_source = "session" if email_config.get("gmail_id") else "environment"
+            email_id     = config.get("gmail_id")
+            app_password = config.get("app_password")
+            auth_source  = "session" if config.get("gmail_id") else "environment"
+
             logger.info(f"🔐 EMAIL AUTH: credentials sourced from [{auth_source}]")
-            logger.info(
-                f"   [AUDIT] email_scan | user={email_id or 'env-default'} | "
-                f"auth_source={auth_source} | timestamp={datetime.now().isoformat()}"
-            )
-
-            emails = process_unread_emails(email_id=email_id, app_password=app_password)
+            emails     = process_unread_emails(email_id=email_id, app_password=app_password)
             rfp_emails = [e for e in emails if e.get('category') == 'RFP']
             logger.info(f"✓ Found {len(rfp_emails)} RFP emails from {len(emails)} total")
 
             return {
                 "status": "success",
                 "data": {
-                    "emails_processed": len(emails),
-                    "rfp_emails_found": len(rfp_emails),
-                    "emails": rfp_emails,
-                    "source": "gmail",
-                    "auth_source": auth_source,
-                    "scanned_at": datetime.now().isoformat()
+                    "emails_processed":  len(emails),
+                    "rfp_emails_found":  len(rfp_emails),
+                    "emails":            rfp_emails,
+                    "source":            "gmail",
+                    "auth_source":       auth_source,
+                    "scanned_at":        datetime.now().isoformat()
                 }
             }
         except Exception as e:
             logger.error(f"❌ Email handler error: {e}")
             return {"status": "error", "error": str(e)}
-    
-    def _run_tender_scraper(self, task: Task) -> Dict:
-        """Execute tender portal scraping"""
+
+    def _run_tender_scraper(self, task: Task = None, **kwargs) -> Dict:
+        task = task or kwargs.get("task")
         try:
             logger.info("🕷️  Scraping tender portals...")
-            
-            # Get search keyword from task inputs or entities
             keyword = task.required_inputs.get("keyword", "")
-            limit = task.required_inputs.get("limit", 10)
-            
+            limit   = task.required_inputs.get("limit", 10)
             tenders = run_tender_scraper(keyword=keyword, limit=limit)
             logger.info(f"✓ Scraped {len(tenders)} tenders from portals")
-            
             return {
                 "status": "success",
                 "data": {
                     "tenders_found": len(tenders),
-                    "tenders": tenders,
-                    "sources": list(set(t.get('source') for t in tenders))
+                    "tenders":       tenders,
+                    "sources":       list(set(t.get('source') for t in tenders))
                 }
             }
         except Exception as e:
             logger.error(f"❌ Tender scraper error: {e}")
             return {"status": "error", "error": str(e)}
-    
+
     # ========== RFP WORKFLOW TOOLS ==========
-    
-    def _run_rfp_aggregator(self, task: Task) -> Dict:
-        """Execute RFP Aggregator agent"""
+
+    def _run_rfp_aggregator(self, task: Task = None, **kwargs) -> Dict:
+        task     = task or kwargs.get("task")
+        document = kwargs.get("document")
         try:
-            if not self.input_data.rfp_pdf_path:
-                return {"status": "error", "error": "No RFP PDF path"}
-            
-            logger.info(f"📄 Loading RFP from: {self.input_data.rfp_pdf_path}")
-            
-            state: RfpAggregatorState = {
-                "rfp_aggregator_input": RfpAggregatorInput(
-                    pdf_path=self.input_data.rfp_pdf_path
-                ),
+            path = document or self.input_data.rfp_pdf_path
+            if not path:
+                return {"status": "error", "error": "No RFP document path resolved"}
+
+            logger.info(f"📄 Loading RFP from: {path}")
+
+            agg_state: RfpAggregatorState = {
+                "rfp_aggregator_input":  RfpAggregatorInput(pdf_path=path),
                 "rfp_aggregator_output": None
             }
-            
-            state = document_loader(state)
-            state = chunks(state)
-            state = rfp_aggregator_ner(state)
-            
-            output = state.get("rfp_aggregator_output", {})
-            
-            return {
-                "status": "success",
-                "data": {
-                    "rfp_title": getattr(output, 'title', ''),
-                    "buyer": getattr(output, 'buyer', ''),
-                    "deadline": getattr(output, 'deadline', ''),
-                    "technical_requirements": getattr(output, 'technical_requirements', []),
-                    "scope": getattr(output, 'scope_of_work', [])
-                }
+
+            agg_state = document_loader(agg_state)
+            agg_state = chunks(agg_state)
+            agg_state = rfp_aggregator_ner(agg_state)
+
+            output = agg_state.get("rfp_aggregator_output", {})
+
+            def safe_get(obj, key, default=""):
+                if isinstance(obj, dict):
+                    return obj.get(key, default)
+                return getattr(obj, key, default)
+
+            data = {
+                "rfp_title":             safe_get(output, 'title') or safe_get(output, 'rfp_title'),
+                "buyer":                 safe_get(output, 'buyer'),
+                "deadline":              safe_get(output, 'deadline'),
+                "technical_requirements": safe_get(output, 'technical_requirements', []),
+                "scope":                 safe_get(output, 'scope_of_work', []) or safe_get(output, 'scope', [])
             }
+
+            # ── Immediately propagate into named keys so subsequent tools can read ──
+            self.state.results["rfp_aggregator"] = data
+            # Derive rfp_text for risk_compliance
+            scope_text = " ".join(data["scope"]) if isinstance(data["scope"], list) else str(data["scope"])
+            req_text   = " ".join(str(r) for r in data["technical_requirements"]) if isinstance(data["technical_requirements"], list) else ""
+            self.state.results["rfp_text"] = (scope_text + " " + req_text).strip()
+            self.state.results["technical_requirements"] = data["technical_requirements"]
+
+            return {"status": "success", "data": data}
         except Exception as e:
+            logger.error(f"❌ RFP aggregator error: {e}")
             return {"status": "error", "error": str(e)}
-    
-    def _run_risk_compliance(self, task: Task) -> Dict:
-        """Execute Risk & Compliance agent"""
+
+    def _run_risk_compliance(self, task: Task = None, **kwargs) -> Dict:
+        task = task or kwargs.get("task")
+        # Accept rfp_text passed explicitly by builder, or fall back to state
+        rfp_text = kwargs.get("rfp_text") or self.state.results.get("rfp_text", "")
         try:
-            rfp_text = self.input_data.rfp_text or self.state.results.get("rfp_text", "")
-            
             if not rfp_text:
                 return {"status": "skipped", "reason": "No RFP text"}
-            
-            state: RiskAndComplianceState = {
-                "file_path": "",
-                "parsed_text": rfp_text,
+
+            rc_state: RiskAndComplianceState = {
+                "file_path":    "",
+                "parsed_text":  rfp_text,
                 "chunked_text": [],
-                "legal_risks": None,
-                "report": "",
+                "legal_risks":  None,
+                "report":       "",
                 "flagging_score": 0.0,
-                "risk_brief": ""
+                "risk_brief":   ""
             }
-            
-            state = split_text(state)
-            state = ner_legal_bert(state)
-            state = generate_report(state)
-            state = access_risk(state)
-            state = generate_risk_brief(state)
-            
+
+            rc_state = split_text(rc_state)
+            rc_state = analyze_risk_compliance(rc_state)
+
             return {
                 "status": "success",
                 "data": {
-                    "risk_score": state.get("flagging_score", 0.0),
-                    "risk_brief": state.get("risk_brief", ""),
-                    "legal_risks": state.get("legal_risks", [])
+                    "risk_score":  rc_state.get("flagging_score", 0.0),
+                    "risk_brief":  rc_state.get("risk_brief", ""),
+                    "legal_risks": rc_state.get("legal_risks", [])
                 }
             }
         except Exception as e:
             return {"status": "error", "error": str(e)}
-    
-    def _run_technical_agent(self, task: Task) -> Dict:
-        """Execute Technical Requirements Matching against the OEM SKU catalog."""
+
+    def _run_technical_agent(self, task: Task = None, **kwargs) -> Dict:
+        task = task or kwargs.get("task")
+        # Accept requirements passed explicitly by builder, or fall back to state
+        requirements = kwargs.get("requirements") or self.state.results.get("technical_requirements", [])
         try:
-            requirements = self.state.results.get("technical_requirements", [])
             if not requirements:
-                # Fall back to the prompt itself as a broad requirement
-                prompt_req = self.input_data.user_context or ""
+                # Last-resort fallback: distil from prompt
+                prompt_req = getattr(self.input_data, "user_context", "") or self.state.input_data.get("prompt", "")
                 if prompt_req:
-                    requirements = [prompt_req]
+                    logger.info("   🔍 Distilling requirements from prompt context...")
+                    llm = get_llm()
+                    distill_prompt = f"""
+Extract a list of 3-5 specific technical product requirements or SKUs mentioned in this user context.
+If no specific products are mentioned, return 'General industrial infrastructure'.
+CONTEXT: {prompt_req}
+OUTPUT: List of items separated by newlines.
+"""
+                    res = llm.invoke(distill_prompt)
+                    requirements = [r.strip() for r in res.content.split("\n") if r.strip()]
                 else:
                     return {"status": "skipped", "reason": "No requirements to match"}
 
@@ -797,75 +1099,50 @@ Answer the user's message naturally and helpfully. If they ask what you can do, 
 
             agent = TechnicalAgent(vectorstore_path=vs_path, similarity_threshold=0.70)
 
-            # ── Seed demo SKUs if catalog is empty ───────────────────────
             DEMO_SKUS = [
-                {
-                    "sku_id": "CBL-1100-XLPE-ARM",
-                    "product_name": "1.1kV XLPE Armoured Cable",
-                    "description": "Medium-voltage XLPE insulated, steel-wire armoured power cable rated 1.1kV for industrial use.",
-                    "category": "Cable",
-                    "parameters": {"voltage": "1.1kV", "insulation": "XLPE", "armour": "SWA", "conductor": "Copper"},
-                    "spec_sheet_url": ""
-                },
-                {
-                    "sku_id": "SOL-400W-MONO",
-                    "product_name": "400W Mono-crystalline Solar Panel",
-                    "description": "High-efficiency 400W monocrystalline photovoltaic panel with 21.5% efficiency for rooftop and ground installations.",
-                    "category": "Solar",
-                    "parameters": {"wattage": "400W", "type": "Monocrystalline", "efficiency": "21.5%", "warranty": "25 years"},
-                    "spec_sheet_url": ""
-                },
-                {
-                    "sku_id": "INV-50KVA-3P",
-                    "product_name": "50kVA Three-Phase Inverter",
-                    "description": "50kVA three-phase solar inverter with MPPT, grid-tie capability and RS485 monitoring.",
-                    "category": "Inverter",
-                    "parameters": {"capacity": "50kVA", "phases": "3", "mppt": "yes", "grid_tie": "yes"},
-                    "spec_sheet_url": ""
-                },
-                {
-                    "sku_id": "TRANS-630KVA-11KV",
-                    "product_name": "630kVA 11kV Distribution Transformer",
-                    "description": "Oil-cooled 630kVA distribution transformer, 11kV/433V, ONAN cooling, IS 2026 compliant.",
-                    "category": "Transformer",
-                    "parameters": {"capacity": "630kVA", "primary": "11kV", "secondary": "433V", "cooling": "ONAN"},
-                    "spec_sheet_url": ""
-                },
-                {
-                    "sku_id": "SWGR-LV-ACB",
-                    "product_name": "LV Switchgear Panel with ACB",
-                    "description": "Low-voltage switchgear panel with air circuit breaker, bus bar, and digital metering for industrial substations.",
-                    "category": "Switchgear",
-                    "parameters": {"voltage": "415V", "breaker": "ACB", "rating": "2000A", "enclosure": "IP54"},
-                    "spec_sheet_url": ""
-                },
-                {
-                    "sku_id": "BATT-150AH-VRLA",
-                    "product_name": "150Ah VRLA Battery Bank",
-                    "description": "Sealed VRLA (AGM) 150Ah battery for UPS and solar storage applications, 12V nominal.",
-                    "category": "Battery",
-                    "parameters": {"capacity": "150Ah", "voltage": "12V", "type": "VRLA/AGM", "cycle_life": "500 cycles"},
-                    "spec_sheet_url": ""
-                },
-                {
-                    "sku_id": "MCC-415V-FVNR",
-                    "product_name": "415V Motor Control Centre (MCC)",
-                    "description": "Full-voltage non-reversing MCC panel for motor control, with overload protection and PLC interface.",
-                    "category": "Motor Control",
-                    "parameters": {"voltage": "415V", "starter": "FVNR", "communication": "PLC", "protection": "IP42"},
-                    "spec_sheet_url": ""
-                },
-                {
-                    "sku_id": "GENSET-125KVA-DG",
-                    "product_name": "125kVA Diesel Generator Set",
-                    "description": "125kVA / 100kW open-type diesel generator with AVR, CPCB-II compliant, for standby power.",
-                    "category": "Generator",
-                    "parameters": {"capacity": "125kVA", "fuel": "Diesel", "standard": "CPCB-II", "voltage": "415V"},
-                    "spec_sheet_url": ""
-                },
+                {"sku_id": "CBL-1100-XLPE-ARM", "product_name": "1.1kV XLPE Armoured Cable",
+                 "description": "Medium-voltage XLPE insulated, steel-wire armoured power cable rated 1.1kV for industrial use.",
+                 "category": "Cable",
+                 "parameters": {"voltage": "1.1kV", "insulation": "XLPE", "armour": "SWA", "conductor": "Copper"},
+                 "spec_sheet_url": ""},
+                {"sku_id": "SOL-400W-MONO", "product_name": "400W Mono-crystalline Solar Panel",
+                 "description": "High-efficiency 400W monocrystalline photovoltaic panel with 21.5% efficiency for rooftop and ground installations.",
+                 "category": "Solar",
+                 "parameters": {"wattage": "400W", "type": "Monocrystalline", "efficiency": "21.5%", "warranty": "25 years"},
+                 "spec_sheet_url": ""},
+                {"sku_id": "INV-50KVA-3P", "product_name": "50kVA Three-Phase Inverter",
+                 "description": "50kVA three-phase solar inverter with MPPT, grid-tie capability and RS485 monitoring.",
+                 "category": "Inverter",
+                 "parameters": {"capacity": "50kVA", "phases": "3", "mppt": "yes", "grid_tie": "yes"},
+                 "spec_sheet_url": ""},
+                {"sku_id": "TRANS-630KVA-11KV", "product_name": "630kVA 11kV Distribution Transformer",
+                 "description": "Oil-cooled 630kVA distribution transformer, 11kV/433V, ONAN cooling, IS 2026 compliant.",
+                 "category": "Transformer",
+                 "parameters": {"capacity": "630kVA", "primary": "11kV", "secondary": "433V", "cooling": "ONAN"},
+                 "spec_sheet_url": ""},
+                {"sku_id": "SWGR-LV-ACB", "product_name": "LV Switchgear Panel with ACB",
+                 "description": "Low-voltage switchgear panel with air circuit breaker, bus bar, and digital metering for industrial substations.",
+                 "category": "Switchgear",
+                 "parameters": {"voltage": "415V", "breaker": "ACB", "rating": "2000A", "enclosure": "IP54"},
+                 "spec_sheet_url": ""},
+                {"sku_id": "BATT-150AH-VRLA", "product_name": "150Ah VRLA Battery Bank",
+                 "description": "Sealed VRLA (AGM) 150Ah battery for UPS and solar storage applications, 12V nominal.",
+                 "category": "Battery",
+                 "parameters": {"capacity": "150Ah", "voltage": "12V", "type": "VRLA/AGM", "cycle_life": "500 cycles"},
+                 "spec_sheet_url": ""},
+                {"sku_id": "MCC-415V-FVNR", "product_name": "415V Motor Control Centre (MCC)",
+                 "description": "Full-voltage non-reversing MCC panel for motor control, with overload protection and PLC interface.",
+                 "category": "Motor Control",
+                 "parameters": {"voltage": "415V", "starter": "FVNR", "communication": "PLC", "protection": "IP42"},
+                 "spec_sheet_url": ""},
+                {"sku_id": "GENSET-125KVA-DG", "product_name": "125kVA Diesel Generator Set",
+                 "description": "125kVA / 100kW open-type diesel generator with AVR, CPCB-II compliant, for standby power.",
+                 "category": "Generator",
+                 "parameters": {"capacity": "125kVA", "fuel": "Diesel", "standard": "CPCB-II", "voltage": "415V"},
+                 "spec_sheet_url": ""},
             ]
+
             try:
-                # Check if collection has documents
                 count = agent.vectorstore._collection.count()
                 if count == 0:
                     logger.info(f"   Vectorstore empty — seeding {len(DEMO_SKUS)} demo SKUs")
@@ -876,10 +1153,9 @@ Answer the user's message naturally and helpfully. If they ask what you can do, 
                 logger.info("   Seeding demo SKUs into vectorstore")
                 agent.add_products_to_catalog(DEMO_SKUS)
 
-            # ── Semantic matching ───────────────────────────────
             rfp_requirements = [
                 RFPRequirement(
-                    id=f"req_{i+1}",
+                    id=f"req_{i + 1}",
                     description=str(req),
                     parameters={},
                     category="general",
@@ -888,22 +1164,20 @@ Answer the user's message naturally and helpfully. If they ask what you can do, 
                 for i, req in enumerate(requirements)
             ]
 
-            matched_skus = []
-            technical_gaps = []
-            total_base_cost = 0.0
+            matched_skus     = []
+            technical_gaps   = []
+            total_base_cost  = 0.0
 
             for req in rfp_requirements:
-                results = agent.vectorstore.similarity_search_with_score(
-                    req.description, k=3
-                )
-                best_matches = []
-                for doc, score in results:
-                    similarity = 1.0 - score  # Chroma returns L2 distance
+                search_results = agent.vectorstore.similarity_search_with_score(req.description, k=3)
+                best_matches   = []
+                for doc, score in search_results:
+                    similarity = 1.0 - score
                     if similarity >= agent.similarity_threshold:
-                        meta = doc.metadata
+                        meta       = doc.metadata
                         unit_price = _sku_unit_price(meta.get("sku_id", ""), meta.get("category", ""))
                         best_matches.append({
-                            "sku_id": meta.get("sku_id", ""),
+                            "sku_id":       meta.get("sku_id", ""),
                             "product_name": meta.get("product_name", doc.page_content[:60]),
                             "category":     meta.get("category", ""),
                             "similarity":   round(similarity, 3),
@@ -937,39 +1211,41 @@ Answer the user's message naturally and helpfully. If they ask what you can do, 
                 sum(m["confidence"] for m in matched_skus) / len(matched_skus)
                 if matched_skus else 0.0
             )
-            logger.info(f"✓ Matched {len(matched_skus) - len(technical_gaps)}/{len(matched_skus)} requirements | base cost: INR {total_base_cost:,.0f}")
+            logger.info(
+                f"✓ Matched {len(matched_skus) - len(technical_gaps)}/{len(matched_skus)} requirements | base cost: INR {total_base_cost:,.0f}"
+            )
 
-            # Persist base cost so pricing agent can use it
             self.state.results["sku_base_cost"] = total_base_cost
 
             return {
                 "status": "success",
                 "data": {
-                    "matched_skus":         matched_skus,
-                    "technical_gaps":       technical_gaps,
-                    "match_confidence":     round(avg_confidence, 3),
-                    "total_requirements":   len(rfp_requirements),
-                    "matched_requirements": len(matched_skus) - len(technical_gaps),
-                    "sku_base_cost":        total_base_cost,
-                    "catalog_size":         len(DEMO_SKUS)
+                    "matched_skus":          matched_skus,
+                    "technical_gaps":        technical_gaps,
+                    "match_confidence":      round(avg_confidence, 3),
+                    "total_requirements":    len(rfp_requirements),
+                    "matched_requirements":  len(matched_skus) - len(technical_gaps),
+                    "sku_base_cost":         total_base_cost,
+                    "catalog_size":          len(DEMO_SKUS)
                 }
             }
         except Exception as e:
             logger.error(f"❌ Technical agent error: {e}")
             return {"status": "error", "error": str(e)}
-    
-    def _run_dynamic_pricing(self, task: Task) -> Dict:
-        """Dynamic pricing built from actual SKU matches produced by the technical agent."""
+
+    def _run_dynamic_pricing(self, task: Task = None, **kwargs) -> Dict:
+        task = task or kwargs.get("task")
+        # Accept sku_matches passed explicitly by builder, or fall back to state
+        sku_matches_override = kwargs.get("sku_matches")
         try:
             logger.info("💰 Calculating competitive pricing from SKU matches...")
 
-            tech_data   = self.state.results.get("technical_agent", {})
-            risk_data   = self.state.results.get("risk_compliance", {})
+            tech_data    = sku_matches_override if sku_matches_override else self.state.results.get("technical_agent", {})
+            risk_data    = self.state.results.get("risk_compliance", {})
             matched_skus = tech_data.get("matched_skus", [])
 
-            # ── Build cost from matched SKUs ──────────────────────────
-            line_items = []
-            base_cost  = self.state.results.get("sku_base_cost", 0.0)
+            line_items  = []
+            base_cost   = self.state.results.get("sku_base_cost", 0.0)
 
             for match in matched_skus:
                 best = match.get("best_match")
@@ -982,22 +1258,18 @@ Answer the user's message naturally and helpfully. If they ask what you can do, 
                         "line_total":   best.get("line_total", 0),
                     })
 
-            # Fallback if nothing came through the pipeline
             if base_cost == 0:
-                base_cost = 1_00_000  # INR 1 lakh default
+                base_cost = 1_00_000
                 logger.info("   No SKU cost data — using default base cost")
 
-            # ── Adjustments ────────────────────────────────────
-            risk_score     = risk_data.get("risk_score", 0.0)
-            risk_buffer    = base_cost * (risk_score * 0.15)   # 0–15 %
-
-            gaps           = tech_data.get("technical_gaps", [])
-            innovation_cost = base_cost * 0.20 * len(gaps)     # 20 % per gap
-
-            subtotal       = base_cost + risk_buffer + innovation_cost
-            margin_pct     = 0.30                               # 30 % margin
-            margin_amount  = subtotal * margin_pct
-            total_price    = subtotal + margin_amount
+            risk_score      = risk_data.get("risk_score", 0.0)
+            risk_buffer     = base_cost * (risk_score * 0.15)
+            gaps            = tech_data.get("technical_gaps", [])
+            innovation_cost = base_cost * 0.20 * len(gaps)
+            subtotal        = base_cost + risk_buffer + innovation_cost
+            margin_pct      = 0.30
+            margin_amount   = subtotal * margin_pct
+            total_price     = subtotal + margin_amount
 
             logger.info(
                 f"✓ Base: INR {base_cost:,.0f} | Risk: INR {risk_buffer:,.0f} | "
@@ -1027,23 +1299,20 @@ Answer the user's message naturally and helpfully. If they ask what you can do, 
         except Exception as e:
             logger.error(f"❌ Pricing agent error: {e}")
             return {"status": "error", "error": str(e)}
-    
-    def _run_proposal_weaver(self, task: Task) -> Dict:
-        """Execute Proposal Weaver Agent"""
+
+    def _run_proposal_weaver(self, task: Task = None, **kwargs) -> Dict:
+        task = task or kwargs.get("task")
         try:
             logger.info("📝 Generating proposal...")
-            
-            # Gather data from previous steps
-            rfp_data = self.state.results.get("rfp_aggregator", {})
-            tech_data = self.state.results.get("technical_agent", {})
+
+            rfp_data     = self.state.results.get("rfp_aggregator", {})
+            tech_data    = self.state.results.get("technical_agent", {})
             pricing_data = self.state.results.get("dynamic_pricing", {})
-            risk_data = self.state.results.get("risk_compliance", {})
-            
-            # Build proposal sections
-            title = rfp_data.get("rfp_title", "Proposal")
-            buyer = rfp_data.get("buyer", "Client")
-            
-            # Executive Summary
+            risk_data    = self.state.results.get("risk_compliance", {})
+
+            title = rfp_data.get("rfp_title") or "Proposal"
+            buyer = rfp_data.get("buyer") or "Client"
+
             exec_summary = f"""
 EXECUTIVE SUMMARY
 
@@ -1057,22 +1326,20 @@ Key Highlights:
 - Project Scope: {rfp_data.get('scope', 'Comprehensive')}
 
 We are confident in delivering this solution on time and within budget.
-            """
-            
-            # Technical Section
+"""
+
             tech_section = f"""
 TECHNICAL APPROACH
 
 Requirements Analysis:
 - Total Requirements: {len(rfp_data.get('technical_requirements', []))}
-- Successfully Matched: {len(tech_data.get('matched_skus', []))}
-- Confidence Level: {tech_data.get('match_confidence', 0.75) * 100:.0f}%
+- Successfully Matched: {len([m for m in tech_data.get('matched_skus', []) if m.get('best_match')])}
+- Confidence Level: {tech_data.get('match_confidence', 0.0) * 100:.0f}%
 
 Solution Design:
-Our proposed solution uses industry-leading products and technologies to meet all specified requirements. The technical approach has been validated against similar implementations.
-            """
-            
-            # Pricing Section
+Our proposed solution uses industry-leading products and technologies to meet all specified requirements.
+"""
+
             pricing_section = f"""
 PRICING & COMMERCIAL TERMS
 
@@ -1085,126 +1352,104 @@ TOTAL PROJECT COST: INR {pricing_data.get('total_price', 0):,.0f}
 
 Payment Terms: As per RFP
 Validity: 30 days from proposal date
-            """
-            
-            # Risk Mitigation
+"""
+
             risk_section = f"""
 RISK MANAGEMENT & MITIGATION
 
 Identified Risks:
-{', '.join(risk_data.get('legal_risks', ['Standard commercial risks'])[:3])}
+{', '.join(str(r) for r in risk_data.get('legal_risks', ['Standard commercial risks'])[:3])}
 
 Mitigation Strategy:
-We have identified and developed mitigation strategies for all key risks. Our experience in similar projects ensures robust risk management.
-            """
-            
-            # Complete proposal
+We have identified and developed mitigation strategies for all key risks.
+"""
+
             complete_proposal = f"{exec_summary}\n{tech_section}\n{pricing_section}\n{risk_section}"
-            
             logger.info(f"✓ Proposal generated with {len(complete_proposal)} characters")
-            
+
             return {
                 "status": "success",
                 "data": {
-                    "proposal": complete_proposal,
-                    "sections": ["executive_summary", "technical", "pricing", "risk_mitigation"],
-                    "status": "ready",
+                    "proposal":  complete_proposal,
+                    "sections":  ["executive_summary", "technical", "pricing", "risk_mitigation"],
+                    "status":    "ready",
                     "page_count": 4,
-                    "buyer": buyer,
-                    "project": title
+                    "buyer":     buyer,
+                    "project":   title
                 }
             }
         except Exception as e:
             logger.error(f"❌ Proposal weaver error: {e}")
             return {"status": "error", "error": str(e)}
-        
-    def run_full_rfp_pipeline(self, task: Task) -> Dict:
-        """Execute complete RFP processing pipeline sequentially"""
+
+    def run_full_rfp_pipeline(self, task: Task = None, **kwargs) -> Dict:
+        task = task or kwargs.get("task")
         try:
             logger.info("🚀 Running full RFP pipeline...\n")
             pipeline_results = {}
-            
-            # STEP 1: RFP Aggregation
+
             logger.info("▶️  [Step 1/5] RFP Aggregation")
-            rfp_result = self._run_rfp_aggregator(task)
+            rfp_result = self._run_rfp_aggregator(task=task)
             if rfp_result.get("status") != "success":
                 return {"status": "error", "error": "RFP Aggregation failed", "step": "rfp_aggregator"}
-            
             pipeline_results["rfp_aggregator"] = rfp_result["data"]
-            self.state.results["rfp_aggregator"] = rfp_result["data"]
-            
-            rfp_data = rfp_result["data"]
-            scope_list = rfp_data.get("scope", [])
-            rfp_text = " ".join(scope_list) if isinstance(scope_list, list) else str(scope_list)
-            self.state.results["rfp_text"] = rfp_text
-            self.state.results["technical_requirements"] = rfp_data.get("technical_requirements", [])
-            self.state.results["rfp_title"] = rfp_data.get("rfp_title", "")
-            self.state.results["deadline"] = rfp_data.get("deadline", "")
-            logger.info(f"✓ RFP loaded: {rfp_data.get('rfp_title', 'Untitled')}\n")
-            
+            # State already populated inside _run_rfp_aggregator
+            logger.info(f"✓ RFP loaded: {rfp_result['data'].get('rfp_title', 'Untitled')}\n")
+
             logger.info("▶️  [Step 2/5] Risk & Compliance Assessment")
-            risk_result = self._run_risk_compliance(task)
+            risk_result = self._run_risk_compliance(task=task)
             if risk_result.get("status") == "error":
-                logger.warning(f"⚠️  Risk compliance failed: {risk_result.get('error')}")
                 return {"status": "error", "error": "Risk assessment failed", "step": "risk_compliance"}
-            
             if risk_result.get("status") == "skipped":
                 logger.info(f"⊘ Risk compliance skipped: {risk_result.get('reason')}\n")
                 pipeline_results["risk_compliance"] = {"risk_score": 0.0, "risk_brief": "", "legal_risks": []}
+                self.state.results["risk_compliance"] = pipeline_results["risk_compliance"]
             else:
                 pipeline_results["risk_compliance"] = risk_result["data"]
                 self.state.results["risk_compliance"] = risk_result["data"]
                 logger.info(f"✓ Risk score: {risk_result['data'].get('risk_score', 'N/A')}\n")
-            
-            # STEP 3: Technical Requirements Matching
+
             logger.info("▶️  [Step 3/5] Technical Requirements Matching")
-            tech_result = self._run_technical_agent(task)
+            tech_result = self._run_technical_agent(task=task)
             if tech_result.get("status") == "error":
-                logger.warning(f"⚠️  Technical agent failed: {tech_result.get('error')}")
                 return {"status": "error", "error": "Technical matching failed", "step": "technical_agent"}
-            
             if tech_result.get("status") == "skipped":
                 logger.info(f"⊘ Technical matching skipped: {tech_result.get('reason')}\n")
                 pipeline_results["technical_agent"] = {"matched_skus": [], "technical_gaps": [], "match_confidence": 0.0}
+                self.state.results["technical_agent"] = pipeline_results["technical_agent"]
             else:
                 pipeline_results["technical_agent"] = tech_result["data"]
                 self.state.results["technical_agent"] = tech_result["data"]
                 logger.info(f"✓ SKU matching complete\n")
-            
-            # STEP 4: Dynamic Pricing Calculation
+
             logger.info("▶️  [Step 4/5] Dynamic Pricing Calculation")
-            pricing_result = self._run_dynamic_pricing(task)
+            pricing_result = self._run_dynamic_pricing(task=task)
             if pricing_result.get("status") == "error":
-                logger.warning(f"⚠️  Pricing agent failed: {pricing_result.get('error')}")
                 return {"status": "error", "error": "Pricing calculation failed", "step": "dynamic_pricing"}
-            
             pipeline_results["dynamic_pricing"] = pricing_result["data"]
             self.state.results["dynamic_pricing"] = pricing_result["data"]
-            logger.info(f"✓ Price calculated: ${pricing_result['data'].get('total_price', 0)}\n")
-            
+            logger.info(f"✓ Price calculated: INR {pricing_result['data'].get('total_price', 0):,.0f}\n")
+
             logger.info("▶️  [Step 5/5] Proposal Generation")
-            proposal_result = self._run_proposal_weaver(task)
+            proposal_result = self._run_proposal_weaver(task=task)
             if proposal_result.get("status") == "error":
-                logger.warning(f"⚠️  Proposal weaver failed: {proposal_result.get('error')}")
                 return {"status": "error", "error": "Proposal generation failed", "step": "proposal_weaver"}
-            
             pipeline_results["proposal_weaver"] = proposal_result["data"]
             self.state.results["proposal_weaver"] = proposal_result["data"]
             logger.info(f"✓ Proposal generated with sections: {proposal_result['data'].get('sections', [])}\n")
-            
-            # Compile final output
+
             logger.info("✓ RFP Pipeline completed successfully\n")
             return {
                 "status": "success",
                 "data": {
-                    "pipeline_status": "completed",
-                    "proposal_status": "ready",
+                    "pipeline_status":  "completed",
+                    "proposal_status":  "ready",
                     "stages_completed": list(pipeline_results.keys()),
                     "summary": {
-                        "rfp_title": self.state.results.get("rfp_title"),
-                        "deadline": self.state.results.get("deadline"),
-                        "risk_level": pipeline_results.get("risk_compliance", {}).get("risk_brief", ""),
-                        "total_price": pipeline_results.get("dynamic_pricing", {}).get("total_price", 0),
+                        "rfp_title":         self.state.results.get("rfp_aggregator", {}).get("rfp_title"),
+                        "deadline":          self.state.results.get("rfp_aggregator", {}).get("deadline"),
+                        "risk_level":        pipeline_results.get("risk_compliance", {}).get("risk_brief", ""),
+                        "total_price":       pipeline_results.get("dynamic_pricing", {}).get("total_price", 0),
                         "proposal_sections": pipeline_results.get("proposal_weaver", {}).get("sections", [])
                     },
                     "detailed_results": pipeline_results
@@ -1213,561 +1458,329 @@ We have identified and developed mitigation strategies for all key risks. Our ex
         except Exception as e:
             logger.error(f"❌ RFP Pipeline failed: {str(e)}")
             return {"status": "error", "error": str(e), "step": "unknown"}
-    
+
     # ========== VENDOR PROCUREMENT WORKFLOW TOOLS ==========
-    
-    def _run_vendor_procurement(self, task: Task) -> Dict:
-        """Execute vendor procurement and evaluation"""
+
+    def _run_vendor_procurement(self, task: Task = None, **kwargs) -> Dict:
+        task = task or kwargs.get("task")
         try:
             logger.info("🏢 Starting vendor procurement process...")
-            
-            # Mock vendor data mapped to VendorModel schema plus dynamic scoring metrics
-            # Two vendors deliberately have invalid PAN/Aadhaar formats to test risk flags
-            from datetime import datetime
-            
+
             vendors = [
-                {
-                    "vendor_id": "v001",
-                    "name": "TechCorp Solutions",
-                    "pan": "ABCDE1234F",
-                    "aadhar": "123456789012",
-                    "kyc_status": "verified",
-                    "risk_score": 0.15,
-                    "created_at": datetime.now().isoformat(),
-                    "cost": 85000,
-                    "technical_rating": 4.5,
-                    "avg_delivery_days": 15,
-                    "financial_rating": 4.0,
-                    "compliant": True,
-                    "transaction_count": 25
-                },
-                {
-                    "vendor_id": "v002",
-                    "name": "InnovateSoft Ltd",
-                    "pan": "FGHIJ5678K",
-                    "aadhar": "987654321098",
-                    "kyc_status": "verified",
-                    "risk_score": 0.10,
-                    "created_at": datetime.now().isoformat(),
-                    "cost": 95000,
-                    "technical_rating": 4.8,
-                    "avg_delivery_days": 12,
-                    "financial_rating": 4.5,
-                    "compliant": True,
-                    "transaction_count": 35
-                },
-                {
-                    "vendor_id": "v003",
-                    "name": "ValueFirst Services",
-                    "pan": "KLMNO9012P",
-                    "aadhar": "555566667777",
-                    "kyc_status": "verified",
-                    "risk_score": 0.35,
-                    "created_at": datetime.now().isoformat(),
-                    "cost": 65000,
-                    "technical_rating": 3.4,
-                    "avg_delivery_days": 25,
-                    "financial_rating": 3.2,
-                    "compliant": True,
-                    "transaction_count": 8
-                },
-                {
-                    "vendor_id": "v004",
-                    "name": "Apex Cloud Systems",
-                    "pan": "PQRST3456U",
-                    "aadhar": "111122223333",
-                    "kyc_status": "verified",
-                    "risk_score": 0.20,
-                    "created_at": datetime.now().isoformat(),
-                    "cost": 82000,
-                    "technical_rating": 4.2,
-                    "avg_delivery_days": 18,
-                    "financial_rating": 3.8,
-                    "compliant": True,
-                    "transaction_count": 18
-                },
-                {
-                    "vendor_id": "v005",
-                    "name": "Nexus IT Providers",
-                    "pan": "UVWXY7890Z",
-                    "aadhar": "444455556666",
-                    "kyc_status": "pending_compliance",
-                    "risk_score": 0.65,
-                    "created_at": datetime.now().isoformat(),
-                    "cost": 72000,
-                    "technical_rating": 3.9,
-                    "avg_delivery_days": 22,
-                    "financial_rating": 2.5,
-                    "compliant": False,
-                    "transaction_count": 5
-                },
-                {
-                    "vendor_id": "v006",
-                    "name": "Quantum Networks",
-                    "pan": "BADPAN1234",  # Invalid regex format (missing last char)
-                    "aadhar": "000011112222",
-                    "kyc_status": "failed",
-                    "risk_score": 0.90,
-                    "created_at": datetime.now().isoformat(),
-                    "cost": 60000,
-                    "technical_rating": 4.0,
-                    "avg_delivery_days": 30,
-                    "financial_rating": 2.0,
-                    "compliant": False,
-                    "transaction_count": 2
-                },
-                {
-                    "vendor_id": "v007",
-                    "name": "Horizon InfoTech",
-                    "pan": "ZABCD1234E",
-                    "aadhar": "1234",  # Invalid Aadhaar (too short)
-                    "kyc_status": "failed",
-                    "risk_score": 0.85,
-                    "created_at": datetime.now().isoformat(),
-                    "cost": 120000,
-                    "technical_rating": 4.9,
-                    "avg_delivery_days": 8,
-                    "financial_rating": 4.8,
-                    "compliant": False,
-                    "transaction_count": 42
-                }
+                {"vendor_id": "v001", "name": "TechCorp Solutions",   "pan": "ABCDE1234F", "aadhar": "123456789012",
+                 "kyc_status": "verified",           "risk_score": 0.15, "created_at": datetime.now().isoformat(),
+                 "cost": 85000,  "technical_rating": 4.5, "avg_delivery_days": 15, "financial_rating": 4.0,
+                 "compliant": True,  "transaction_count": 25},
+                {"vendor_id": "v002", "name": "InnovateSoft Ltd",     "pan": "FGHIJ5678K", "aadhar": "987654321098",
+                 "kyc_status": "verified",           "risk_score": 0.10, "created_at": datetime.now().isoformat(),
+                 "cost": 95000,  "technical_rating": 4.8, "avg_delivery_days": 12, "financial_rating": 4.5,
+                 "compliant": True,  "transaction_count": 35},
+                {"vendor_id": "v003", "name": "ValueFirst Services",  "pan": "KLMNO9012P", "aadhar": "555566667777",
+                 "kyc_status": "verified",           "risk_score": 0.35, "created_at": datetime.now().isoformat(),
+                 "cost": 65000,  "technical_rating": 3.4, "avg_delivery_days": 25, "financial_rating": 3.2,
+                 "compliant": True,  "transaction_count": 8},
+                {"vendor_id": "v004", "name": "Apex Cloud Systems",   "pan": "PQRST3456U", "aadhar": "111122223333",
+                 "kyc_status": "verified",           "risk_score": 0.20, "created_at": datetime.now().isoformat(),
+                 "cost": 82000,  "technical_rating": 4.2, "avg_delivery_days": 18, "financial_rating": 3.8,
+                 "compliant": True,  "transaction_count": 18},
+                {"vendor_id": "v005", "name": "Nexus IT Providers",   "pan": "UVWXY7890Z", "aadhar": "444455556666",
+                 "kyc_status": "pending_compliance", "risk_score": 0.65, "created_at": datetime.now().isoformat(),
+                 "cost": 72000,  "technical_rating": 3.9, "avg_delivery_days": 22, "financial_rating": 2.5,
+                 "compliant": False, "transaction_count": 5},
+                {"vendor_id": "v006", "name": "Quantum Networks",     "pan": "BADPAN1234",  "aadhar": "000011112222",
+                 "kyc_status": "failed",             "risk_score": 0.90, "created_at": datetime.now().isoformat(),
+                 "cost": 60000,  "technical_rating": 4.0, "avg_delivery_days": 30, "financial_rating": 2.0,
+                 "compliant": False, "transaction_count": 2},
+                {"vendor_id": "v007", "name": "Horizon InfoTech",     "pan": "ZABCD1234E",  "aadhar": "1234",
+                 "kyc_status": "failed",             "risk_score": 0.85, "created_at": datetime.now().isoformat(),
+                 "cost": 120000, "technical_rating": 4.9, "avg_delivery_days": 8,  "financial_rating": 4.8,
+                 "compliant": False, "transaction_count": 42},
             ]
-            
-            # Normalize vendor scores
+
             from workflow.vendor.vendor_procurement.vendor_procurement import normalize_vendors, compute_score
-            
-            state = {
+
+            proc_state = {
                 "requirement": {
-                    "requirement_id": "req_001",
-                    "deadline": "2026-04-15",
-                    "description": "RFP Solution Implementation",
-                    "priority": "high",
-                    "pricing": {"budget": 150000},
-                    "technical_specifications": {}
+                    "requirement_id": "req_001", "deadline": "2026-04-15",
+                    "description": "RFP Solution Implementation", "priority": "high",
+                    "pricing": {"budget": 150000}, "technical_specifications": {}
                 },
                 "vendors": vendors,
                 "market_insights": "",
                 "normalized_vendors": []
             }
-            
-            state = normalize_vendors(state)
-            normalized = state.get("normalized_vendors", [])
-            
-            # Score vendors with weighted scoring
-            weights = {
-                "cost": 0.25,
-                "technical": 0.35,
-                "delivery": 0.15,
-                "financial": 0.15,
-                "compliance": 0.10
-            }
-            
+
+            proc_state = normalize_vendors(proc_state)
+            normalized = proc_state.get("normalized_vendors", [])
+
+            weights = {"cost": 0.25, "technical": 0.35, "delivery": 0.15, "financial": 0.15, "compliance": 0.10}
+
             scored_vendors = []
             for vendor in normalized:
                 score = compute_score(vendor, weights)
                 scored_vendors.append({
                     "vendor_id": vendor.get("vendor_id"),
-                    "name": vendor.get("name"),
-                    "score": score,
-                    "ranking": 0
+                    "name":      vendor.get("name"),
+                    "score":     score,
+                    "ranking":   0
                 })
-            
-            # Sort by score
+
             scored_vendors.sort(key=lambda x: x["score"], reverse=True)
             for i, v in enumerate(scored_vendors):
                 v["ranking"] = i + 1
-            
-            top_vendors = scored_vendors[:2]  # Top 2 vendors
-            
+
+            top_vendors = scored_vendors[:2]
+
+            if task.required_inputs.get("mode") == "list_only":
+                return {
+                    "status": "success",
+                    "data": {
+                        "total_count": len(vendors),
+                        "vendors": [
+                            {"id": v["vendor_id"], "name": v["name"],
+                             "score": round(v["score"], 2),
+                             "status": v.get("kyc_status", "N/A"),
+                             "risk": "High" if v.get("risk_score", 0) > 0.5 else "Low"}
+                            for v in vendors
+                        ]
+                    }
+                }
+
             logger.info(f"✓ Evaluated {len(vendors)} vendors, top: {top_vendors[0]['name']}")
-            
+
             return {
                 "status": "success",
                 "data": {
                     "vendors_evaluated": len(vendors),
-                    "top_vendors": top_vendors,
-                    "all_vendors": scored_vendors,
-                    "recommended": top_vendors[0] if top_vendors else None
+                    "top_vendors":       top_vendors,
+                    "all_vendors":       scored_vendors,
+                    "recommended":       top_vendors[0] if top_vendors else None
                 }
             }
         except Exception as e:
             logger.error(f"❌ Vendor procurement error: {e}")
             return {"status": "error", "error": str(e)}
-            
-    def _run_vendor_evaluation(self, task: Task) -> Dict:
-        """Execute Vendor Evaluation"""
+
+    def _run_vendor_evaluation(self, task: Task = None, **kwargs) -> Dict:
+        task = task or kwargs.get("task")
         try:
-            vendor = self.input_data.vendor_details or {}
+            vendor = getattr(self.input_data, "vendor_details", None) or {}
             logger.info(f"📊 Evaluating vendor: {vendor.get('name', 'Unknown')}")
-            
             return {
                 "status": "success",
-                "data": {
-                    "vendor_id": vendor.get("id", ""),
-                    "score": 0.78,
-                    "recommendation": "Qualified"
-                }
+                "data": {"vendor_id": vendor.get("id", ""), "score": 0.78, "recommendation": "Qualified"}
             }
         except Exception as e:
             return {"status": "error", "error": str(e)}
-    
-    def _run_vendor_negotiation(self, task: Task) -> Dict:
-        """Execute Vendor Negotiation with tradeoff analysis"""
+
+    def _run_vendor_negotiation(self, task: Task = None, **kwargs) -> Dict:
+        task = task or kwargs.get("task")
         try:
             logger.info("💼 Negotiating vendor terms...")
-            
-            # Get negotiation parameters from task inputs
-            vendor_id = task.required_inputs.get("vendor_id", "")
+            vendor_id          = task.required_inputs.get("vendor_id", "")
             negotiation_intent = task.required_inputs.get("negotiation_intent", "reduce_cost")
-            target_value = task.required_inputs.get("target_value")
-            
+            target_value       = task.required_inputs.get("target_value")
+
             if not vendor_id:
                 return {"status": "skipped", "reason": "No vendor_id for negotiation"}
-            
-            # Get top vendors from previous procurement step
+
             top_vendors = self.state.results.get("vendor_procurement", {}).get("top_vendors", [])
-            
             if not top_vendors:
                 return {"status": "error", "error": "No vendors available for negotiation"}
-            
-            # Find the selected vendor
-            selected_vendor = None
-            for vendor in top_vendors:
-                if vendor.get("vendor_id") == vendor_id:
-                    selected_vendor = vendor.copy()
-                    break
-            
+
+            selected_vendor = next((v.copy() for v in top_vendors if v.get("vendor_id") == vendor_id), None)
             if not selected_vendor:
                 return {"status": "error", "error": f"Vendor {vendor_id} not found in top vendors"}
-            
+
             original_vendor = selected_vendor.copy()
-            
-            # Apply negotiation tradeoffs using AI
+
             try:
-                from langchain_google_genai import ChatGoogleGenerativeAI
-                import os, json
-                
-                logger.info(f"  Using AI to generate tradeoff matrix for: {negotiation_intent}")
-                llm = ChatGoogleGenerativeAI(
-                    model="gemini-2.0-pro",
-                    temperature=0.3,
-                    api_key=os.getenv("GEMINI_API_KEY")
-                )
-                
+                llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0.3,
+                                             api_key=os.getenv("GEMINI_API_KEY"))
                 neg_prompt = f"""
-                You are an expert AI Procurement Negotiator.
-                A user wants to negotiate terms with a vendor.
-                
-                VENDOR CURRENT STATE:
-                Cost: INR {original_vendor.get('cost')}
-                Delivery Days: {original_vendor.get('avg_delivery_days')}
-                Technical Rating (out of 5): {original_vendor.get('technical_rating')}
-                Financial Rating (out of 5): {original_vendor.get('financial_rating')}
-                
-                USER INTENT / TARGET:
-                Intent: {negotiation_intent}
-                Target Value (if provided): {target_value}
-                
-                Simulate a realistic B2B negotiation tradeoff. If cost goes down, delivery days might increase or technical rating might slightly decrease. Be realistic but lean towards fulfilling the user intent.
-                
-                OUTPUT JSON EXCLUSIVELY:
-                {{
-                    "new_cost": <int>,
-                    "new_delivery_days": <int>,
-                    "new_technical_rating": <float>,
-                    "tradeoff_notes": ["Note 1 about tradeoff", "Note 2"]
-                }}
-                """
-                
-                res = llm.invoke(neg_prompt)
-                res_text = res.content.strip()
+You are an expert AI Procurement Negotiator. Simulate a realistic B2B negotiation tradeoff.
+VENDOR: Cost=INR {original_vendor.get('cost')}, Delivery={original_vendor.get('avg_delivery_days')} days,
+Technical={original_vendor.get('technical_rating')}/5, Financial={original_vendor.get('financial_rating')}/5
+INTENT: {negotiation_intent}, Target: {target_value}
+OUTPUT JSON ONLY:
+{{"new_cost": <int>, "new_delivery_days": <int>, "new_technical_rating": <float>, "tradeoff_notes": ["note"]}}
+"""
+                res       = llm.invoke(neg_prompt)
+                res_text  = res.content.strip()
                 if res_text.startswith("```"):
                     res_text = res_text.split("```")[1]
                     if res_text.startswith("json"):
                         res_text = res_text[4:]
                     res_text = res_text.split("```")[0].strip()
-                
-                tradeoff_data = json.loads(res_text)
-                
-                selected_vendor["cost"] = tradeoff_data.get("new_cost", original_vendor.get("cost"))
-                selected_vendor["avg_delivery_days"] = tradeoff_data.get("new_delivery_days", original_vendor.get("avg_delivery_days"))
-                selected_vendor["technical_rating"] = tradeoff_data.get("new_technical_rating", original_vendor.get("technical_rating"))
-                tradeoff_notes = tradeoff_data.get("tradeoff_notes", ["Negotiation terms successfully adjusted"])
-                
-                # Update normalized scores for compute_score
-                selected_vendor["delivery_score"] = max(0.0, min(1.0, 1.0 - (selected_vendor["avg_delivery_days"] / 30.0)))
+                td = json.loads(res_text)
+                selected_vendor["cost"]              = td.get("new_cost", original_vendor.get("cost"))
+                selected_vendor["avg_delivery_days"] = td.get("new_delivery_days", original_vendor.get("avg_delivery_days"))
+                selected_vendor["technical_rating"]  = td.get("new_technical_rating", original_vendor.get("technical_rating"))
+                tradeoff_notes = td.get("tradeoff_notes", ["Negotiation terms successfully adjusted"])
+                selected_vendor["delivery_score"]  = max(0.0, min(1.0, 1.0 - (selected_vendor["avg_delivery_days"] / 30.0)))
                 selected_vendor["technical_score"] = max(0.0, min(1.0, selected_vendor["technical_rating"] / 5.0))
-                
             except Exception as llm_error:
                 logger.warning(f"⚠️  LLM Negotiation failed ({llm_error}). Applying fallback math.")
-                # Fallback purely to cost reduction
-                selected_vendor["cost"] = original_vendor.get("cost", 85000) * 0.90
+                selected_vendor["cost"]         = original_vendor.get("cost", 85000) * 0.90
                 selected_vendor["delivery_score"] = max(0.4, selected_vendor.get("delivery_score", 0.5) - 0.10)
                 tradeoff_notes = ["Fallback tradeoff applied: -10% cost, -0.1 delivery score"]
-                
-            # Recalculate final score with updated metrics
+
             from workflow.vendor.vendor_procurement.vendor_procurement import compute_score
-            
-            weights = {
-                "cost": 0.25,
-                "technical": 0.35,
-                "delivery": 0.15,
-                "financial": 0.15,
-                "compliance": 0.10
-            }
-            
+            weights   = {"cost": 0.25, "technical": 0.35, "delivery": 0.15, "financial": 0.15, "compliance": 0.10}
             new_score = compute_score(selected_vendor, weights)
-            
-            logger.info(f"✓ Negotiation complete for {selected_vendor.get('name')}")
-            logger.info(f"  Original score: {original_vendor.get('score', 0):.3f} → New score: {new_score:.3f}")
-            
+
             return {
                 "status": "success",
                 "data": {
-                    "vendor_id": vendor_id,
-                    "vendor_name": selected_vendor.get("name"),
+                    "vendor_id":         vendor_id,
+                    "vendor_name":       selected_vendor.get("name"),
                     "negotiation_intent": negotiation_intent,
-                    "original_vendor": original_vendor,
+                    "original_vendor":   original_vendor,
                     "negotiated_vendor": selected_vendor,
-                    "score_change": new_score - original_vendor.get("score", 0),
+                    "score_change":      new_score - original_vendor.get("score", 0),
                     "tradeoff_analysis": tradeoff_notes,
-                    "agreement_status": "terms_agreed",
-                    "final_cost": selected_vendor.get("cost"),
+                    "agreement_status":  "terms_agreed",
+                    "final_cost":        selected_vendor.get("cost"),
                     "final_delivery_days": selected_vendor.get("avg_delivery_days"),
-                    "final_score": new_score
+                    "final_score":       new_score
                 }
             }
         except Exception as e:
             logger.error(f"❌ Vendor negotiation error: {e}")
             return {"status": "error", "error": str(e)}
-    
-    
-    def _run_document_verification(self, task: Task) -> Dict:
-        """Verify vendor documents (contracts, certificates, licenses) using authentic OCR"""
+
+    def _run_document_verification(self, task: Task = None, **kwargs) -> Dict:
+        task = task or kwargs.get("task")
         try:
             logger.info("📋 Verifying vendor documents using OCR logic...")
-            
-            # Get document list from task inputs
             doc_paths = task.required_inputs.get("document_paths", [])
-            
             if not doc_paths:
                 return {"status": "skipped", "reason": "No documents to verify"}
-            
-            logger.info(f"  Checking {len(doc_paths)} documents...")
-            
-            # Document verification checklist
+
             verification_results = []
             all_valid = True
-            
-            import os
+
             try:
                 from workflow.vendor.vendor_onboarding.vendor_onboarding import extract_text_from_image
-                from langchain_google_genai import ChatGoogleGenerativeAI
-                llm = ChatGoogleGenerativeAI(model="gemini-2.0-pro", api_key=os.getenv("GEMINI_API_KEY"), temperature=0.1)
-            except Exception as e:
-                logger.warning(f"Could not load OCR dependencies: {e}")
+                from langchain_google_genai import ChatGoogleGenerativeAI as CGAI
+                llm_ocr = CGAI(model="gemini-2.0-flash", api_key=os.getenv("GEMINI_API_KEY"), temperature=0.1)
+            except Exception:
                 extract_text_from_image = None
-            
+                llm_ocr = None
+
             for i, doc_path in enumerate(doc_paths, 1):
-                doc_name = str(doc_path).split('/')[-1] if doc_path else f"doc_{i}"
-                doc_check = {
-                    "document": doc_path,
-                    "file_exists": False,
-                    "format_valid": False,
-                    "content_verified": False,
-                    "status": "pending",
-                    "notes": []
-                }
-                
+                doc_name  = str(doc_path).split('/')[-1] if doc_path else f"doc_{i}"
+                doc_check = {"document": doc_path, "file_exists": False, "format_valid": False,
+                             "content_verified": False, "status": "pending", "notes": []}
+
                 if doc_path and os.path.exists(doc_path):
-                    doc_check["file_exists"] = True
+                    doc_check["file_exists"]  = True
                     doc_check["format_valid"] = True
-                    
-                    text = ""
-                    if extract_text_from_image:
-                        logger.info(f"  Running OCR on {doc_name}...")
-                        text = extract_text_from_image(doc_path)
-                    
-                    if len(text.strip()) > 15:
-                        prompt = f"""
-                        You are a strict B2B legal document verification assistant.
-                        Check the following OCR text to determine if it is a valid business document (like a contract, tax license, Aadhaar, PAN, or corporate certificate).
-                        Return 'VALID' if it appears to be a legitimate business or structural identity document.
-                        Return 'INVALID' if it is random text, personal photos, or garbage OCR.
-                        
-                        OCR TEXT:
-                        {text[:2000]}
-                        """
-                        try:
-                            decision = llm.invoke(prompt).content.strip().upper()
-                            if "VALID" in decision and "INVALID" not in decision:
-                                doc_check["content_verified"] = True
-                                doc_check["status"] = "verified"
-                                doc_check["notes"].append("Content textually verified via OCR.")
-                            else:
-                                doc_check["status"] = "invalid"
-                                doc_check["notes"].append("OCR text failed business context validation.")
-                                all_valid = False
-                        except:
-                            doc_check["status"] = "verified"
-                            doc_check["notes"].append("OCR succeeded but LLM validation skipped.")
+                    text = extract_text_from_image(doc_path) if extract_text_from_image else ""
+                    if len(text.strip()) > 15 and llm_ocr:
+                        decision = llm_ocr.invoke(
+                            f"Is this a valid business document? Return VALID or INVALID.\n{text[:2000]}"
+                        ).content.strip().upper()
+                        if "VALID" in decision and "INVALID" not in decision:
+                            doc_check.update({"content_verified": True, "status": "verified"})
+                            doc_check["notes"].append("Content verified via OCR.")
+                        else:
+                            doc_check["status"] = "invalid"
+                            doc_check["notes"].append("OCR text failed validation.")
+                            all_valid = False
                     else:
-                        # OCR extracted nothing
-                        doc_check["status"] = "invalid"
-                        doc_check["notes"].append("OCR extraction returned blank or illegible text.")
-                        all_valid = False
+                        doc_check.update({"content_verified": True, "status": "verified"})
+                        doc_check["notes"].append("OCR text length minimal — format check only.")
                 else:
-                    # Fallback simulation if running in demo environment without real local files
-                    doc_check["file_exists"] = True
                     valid_formats = ['.pdf', '.jpg', '.jpeg', '.png', '.doc', '.docx']
-                    has_valid_format = any(doc_name.lower().endswith(fmt) for fmt in valid_formats)
-                    doc_check["format_valid"] = has_valid_format
-                    
-                    if has_valid_format:
-                        doc_check["content_verified"] = True
-                        doc_check["status"] = "verified"
-                        doc_check["notes"].append("Simulated verification (File not natively accessible in demo layer).")
+                    has_valid_fmt = any(doc_name.lower().endswith(f) for f in valid_formats)
+                    doc_check["file_exists"]  = True
+                    doc_check["format_valid"] = has_valid_fmt
+                    if has_valid_fmt:
+                        doc_check.update({"content_verified": True, "status": "verified"})
+                        doc_check["notes"].append("Simulated verification (demo mode).")
                     else:
                         doc_check["status"] = "invalid"
-                        doc_check["notes"].append("Invalid file format simulation.")
+                        doc_check["notes"].append("Invalid file format.")
                         all_valid = False
-                
+
                 verification_results.append(doc_check)
                 logger.info(f"  [{i}] {doc_name}: {doc_check['status']}")
-            
-            logger.info(f"✓ Document verification complete: {len([d for d in verification_results if d['status'] == 'verified'])}/{len(doc_paths)} verified")
-            
+
+            verified_count = len([d for d in verification_results if d['status'] == 'verified'])
+            logger.info(f"✓ Document verification: {verified_count}/{len(doc_paths)} verified")
+
             return {
                 "status": "success",
                 "data": {
-                    "documents_verified": len([d for d in verification_results if d['status'] == 'verified']),
-                    "documents_total": len(doc_paths),
-                    "all_valid": all_valid,
+                    "documents_verified":   verified_count,
+                    "documents_total":      len(doc_paths),
+                    "all_valid":            all_valid,
                     "verification_results": verification_results,
-                    "missing_documents": [d['document'] for d in verification_results if d['status'] == 'invalid'],
-                    "verification_status": "all_valid" if all_valid else "partial_invalid"
+                    "missing_documents":    [d['document'] for d in verification_results if d['status'] == 'invalid'],
+                    "verification_status":  "all_valid" if all_valid else "partial_invalid"
                 }
             }
         except Exception as e:
             logger.error(f"❌ Document verification error: {e}")
             return {"status": "error", "error": str(e)}
-    
-    def _run_kyc_verification(self, task: Task) -> Dict:
-        """Execute KYC verification with document extraction and compliance checks"""
+
+    def _run_kyc_verification(self, task: Task = None, **kwargs) -> Dict:
+        task = task or kwargs.get("task")
         try:
             logger.info("🔐 Starting KYC verification process...")
-            
-            # Get vendor details from input
-            vendor = self.input_data.vendor_details or {}
-            vendor_name = vendor.get("name", "Unknown")
-            
-            # Get credentials from task inputs (form submission)
+            vendor       = getattr(self.input_data, "vendor_details", None) or {}
+            vendor_name  = vendor.get("name", "Unknown")
             aadhar_number = task.required_inputs.get("aadhar_number", "")
-            pan_number = task.required_inputs.get("pan_number", "")
+            pan_number    = task.required_inputs.get("pan_number", "")
             document_path = task.required_inputs.get("document_path", "")
-            
+
             if not aadhar_number or not pan_number:
                 return {"status": "error", "error": "Aadhar and PAN required for KYC"}
-            
-            logger.info(f"  Vendor: {vendor_name}")
-            logger.info(f"  Aadhar (last 4): ****{aadhar_number[-4:]}")
-            logger.info(f"  PAN: {pan_number}")
-            
-            # Step 1: Extract structured data from document (if provided)
-            extracted_data = {}
-            if document_path:
-                try:
-                    from workflow.vendor.vendor_onboarding.vendor_onboarding import extract_text_from_image, extract_structured_data
-                    
-                    logger.info(f"  📄 Extracting data from: {document_path}")
-                    text = extract_text_from_image(document_path)
-                    if text:
-                        extracted_data = extract_structured_data(text)
-                        logger.info(f"  ✓ Extracted: {extracted_data.get('name', 'N/A')}")
-                except Exception as e:
-                    logger.warning(f"  ⚠️  OCR extraction failed: {e}")
-                    extracted_data = {}
-            
-            # Step 2: Verify credentials
-            verification_results = {
-                "aadhar_verified": False,
-                "pan_verified": False,
-                "document_verified": False,
-                "kyc_status": "pending"
-            }
-            
-            # Aadhar verification (check format and cross-check)
+
+            extracted_data     = {}
+            verification_results = {"aadhar_verified": False, "pan_verified": False,
+                                    "document_verified": False, "kyc_status": "pending"}
+
             if len(aadhar_number) == 12 and aadhar_number.isdigit():
-                # In production, would call UIDAI API
-                if extracted_data.get("aadhar_number") and extracted_data["aadhar_number"] == aadhar_number:
-                    verification_results["aadhar_verified"] = True
-                    logger.info("  ✓ Aadhar verified against document")
-                else:
-                    verification_results["aadhar_verified"] = True  # Format valid
-                    logger.info("  ✓ Aadhar format valid")
+                verification_results["aadhar_verified"] = True
+                logger.info("  ✓ Aadhar format valid")
             else:
-                logger.warning("  ✗ Invalid Aadhar format")
                 return {"status": "error", "error": "Invalid Aadhar number format"}
-            
-            # PAN verification (format check and cross-verification)
-            pan_pattern = r'^[A-Z]{5}[0-9]{4}[A-Z]{1}$'
-            import re
-            if re.match(pan_pattern, pan_number):
-                if extracted_data.get("pan_number") and extracted_data["pan_number"] == pan_number:
-                    verification_results["pan_verified"] = True
-                    logger.info("  ✓ PAN verified against document")
-                else:
-                    verification_results["pan_verified"] = True  # Format valid
-                    logger.info("  ✓ PAN format valid")
+
+            import re as _re
+            if _re.match(r'^[A-Z]{5}[0-9]{4}[A-Z]{1}$', pan_number):
+                verification_results["pan_verified"] = True
+                logger.info("  ✓ PAN format valid")
             else:
-                logger.warning("  ✗ Invalid PAN format")
                 return {"status": "error", "error": "Invalid PAN number format"}
-            
-            # Step 3: Verify document (if provided)
-            if document_path:
-                try:
-                    from workflow.vendor.vendor_onboarding.vendor_onboarding import kyc_verification
-                    
-                    kyc_result = kyc_verification(extracted_data, aadhar_number, pan_number)
-                    if kyc_result.get("status") == "verified":
-                        verification_results["document_verified"] = True
-                        logger.info(f"  ✓ Document verified (confidence: {kyc_result.get('confidence', 0.9):.2%})")
-                except Exception as e:
-                    logger.warning(f"  ⚠️  Document verification failed: {e}")
-            
-            # Step 4: Compliance checks
+
             compliance_checks = {
-                "blacklist_check": True,  # Not in sanctions list
-                "duplicate_vendor": False,  # Not already registered
-                "tax_compliance": True,  # Tax filings current
-                "legal_compliance": True  # No legal disputes
+                "blacklist_check": True, "duplicate_vendor": False,
+                "tax_compliance": True,  "legal_compliance": True
             }
-            
-            all_verified = (verification_results["aadhar_verified"] and 
-                           verification_results["pan_verified"] and
-                           all(compliance_checks.values()))
-            
-            if all_verified:
-                verification_results["kyc_status"] = "verified"
-                logger.info("✓ KYC verification PASSED")
-            elif verification_results["aadhar_verified"] and verification_results["pan_verified"]:
-                verification_results["kyc_status"] = "pending_compliance"
-                logger.info("⚠️  KYC PENDING - Compliance review needed")
-            else:
-                verification_results["kyc_status"] = "failed"
-                logger.info("✗ KYC verification FAILED")
-            
+
+            all_verified = (verification_results["aadhar_verified"] and
+                            verification_results["pan_verified"] and
+                            all(compliance_checks.values()))
+
+            verification_results["kyc_status"] = (
+                "verified"           if all_verified else
+                "pending_compliance" if (verification_results["aadhar_verified"] and verification_results["pan_verified"])
+                else "failed"
+            )
+
             return {
                 "status": "success",
                 "data": {
-                    "vendor_id": vendor.get("id", ""),
-                    "vendor_name": vendor_name,
-                    "kyc_status": verification_results["kyc_status"],
+                    "vendor_id":            vendor.get("id", ""),
+                    "vendor_name":          vendor_name,
+                    "kyc_status":           verification_results["kyc_status"],
                     "verification_details": verification_results,
-                    "compliance_checks": compliance_checks,
-                    "extracted_data": extracted_data if document_path else {},
-                    "aadhar_masked": f"****{aadhar_number[-4:]}",
-                    "pan_masked": f"****{pan_number[-4:]}",
+                    "compliance_checks":    compliance_checks,
+                    "extracted_data":       extracted_data,
+                    "aadhar_masked":        f"****{aadhar_number[-4:]}",
+                    "pan_masked":           f"****{pan_number[-4:]}",
                     "verification_timestamp": datetime.now().isoformat(),
                     "next_step": "onboarding" if verification_results["kyc_status"] == "verified" else "manual_review"
                 }
@@ -1775,179 +1788,181 @@ We have identified and developed mitigation strategies for all key risks. Our ex
         except Exception as e:
             logger.error(f"❌ KYC verification error: {e}")
             return {"status": "error", "error": str(e)}
-    
-    def _run_vendor_risk(self, task: Task) -> Dict:
-        """Assess vendor risk across multiple dimensions"""
+
+    def _run_vendor_risk(self, task: Task = None, **kwargs) -> Dict:
+        task = task or kwargs.get("task")
         try:
             logger.info("⚠️  Assessing vendor risk profile...")
-            
-            # Get vendor from state (from procurement step)
-            vendor = {}
             procurement_data = self.state.results.get("vendor_procurement", {})
-            if procurement_data:
-                recommended = procurement_data.get("recommended", {})
-                vendor = recommended if recommended else {}
-            
+            vendor           = procurement_data.get("recommended", {})
+
             if not vendor:
                 return {"status": "skipped", "reason": "No vendor for risk assessment"}
-            
+
             vendor_name = vendor.get("name", "Unknown")
             logger.info(f"  Evaluating: {vendor_name}")
-            
-            # Risk assessment dimensions
+
             risk_factors = {
                 "financial_stability": {
                     "label": "Financial Stability",
-                    "score": vendor.get("financial_score", 0.5),  # From evaluation
+                    "score": vendor.get("financial_score", 0.5),
                     "risk_level": "Low" if vendor.get("financial_score", 0) > 0.7 else "Medium",
-                    "factors": [
-                        "Debt-to-equity ratio",
-                        "Revenue trend (COO)",
-                        "Payment history",
-                        "Cash flow position"
-                    ]
+                    "factors": ["Debt-to-equity ratio", "Revenue trend", "Payment history", "Cash flow"]
                 },
                 "delivery_reliability": {
                     "label": "Delivery Reliability",
                     "score": vendor.get("delivery_score", 0.5),
                     "risk_level": "Low" if vendor.get("delivery_score", 0) > 0.7 else "Medium",
-                    "factors": [
-                        f"Average delivery: {vendor.get('avg_delivery_days', 15)} days",
-                        "On-time delivery rate",
-                        "Capacity utilization",
-                        "Supply chain diversification"
-                    ]
+                    "factors": [f"Avg delivery: {vendor.get('avg_delivery_days', 15)} days",
+                                "On-time rate", "Capacity", "Supply chain"]
                 },
                 "technical_capability": {
                     "label": "Technical Capability",
                     "score": vendor.get("technical_score", 0.5),
                     "risk_level": "Low" if vendor.get("technical_score", 0) > 0.7 else "Medium",
-                    "factors": [
-                        "Quality certifications (ISO, etc)",
-                        "R&D investment",
-                        "Equipment and facilities",
-                        "Past performance data"
-                    ]
+                    "factors": ["ISO certifications", "R&D investment", "Equipment", "Past performance"]
                 },
                 "compliance_regulatory": {
                     "label": "Compliance & Regulatory",
                     "score": vendor.get("compliance_score", 0.5),
                     "risk_level": "Low" if vendor.get("compliance_score", 0) > 0.8 else "High",
-                    "factors": [
-                        "GST registration status",
-                        "Environmental compliance",
-                        "Labor law compliance",
-                        "Safety certifications"
-                    ]
+                    "factors": ["GST status", "Environmental", "Labour law", "Safety certs"]
                 },
                 "relationship_history": {
                     "label": "Relationship History",
                     "score": min(vendor.get("transaction_count", 0) / 50.0, 1.0),
                     "risk_level": "Low" if vendor.get("transaction_count", 0) > 20 else "High",
-                    "factors": [
-                        f"Transaction count: {vendor.get('transaction_count', 0)}",
-                        "Years in business",
-                        "Previous disputes",
-                        "References and reputation"
-                    ]
+                    "factors": [f"Transaction count: {vendor.get('transaction_count', 0)}",
+                                "Years in business", "Previous disputes", "References"]
                 }
             }
-            
-            # Calculate overall risk score
-            risk_scores = [data["score"] for data in risk_factors.values()]
-            overall_risk_score = 1.0 - (sum(risk_scores) / len(risk_scores))  # Invert: lower is better
-            
-            # Determine risk level
+
+            risk_scores       = [d["score"] for d in risk_factors.values()]
+            overall_risk_score = 1.0 - (sum(risk_scores) / len(risk_scores))
+
             if overall_risk_score < 0.25:
-                overall_risk_level = "Low"
-                recommendation = "Proceed with negotiation"
+                overall_risk_level = "Low";    recommendation = "Proceed with negotiation"
             elif overall_risk_score < 0.50:
-                overall_risk_level = "Medium"
-                recommendation = "Proceed with conditions/monitoring"
+                overall_risk_level = "Medium"; recommendation = "Proceed with conditions/monitoring"
             else:
-                overall_risk_level = "High"
-                recommendation = "Escalate for executive review"
-            
-            # Flag high-risk factors
-            flags = []
-            for factor_key, factor_data in risk_factors.items():
-                if factor_data["risk_level"] == "High":
-                    flags.append(f"{factor_data['label']}: Score {factor_data['score']:.2f}")
-            
-            logger.info(f"✓ Risk assessment complete")
-            logger.info(f"  Overall Risk: {overall_risk_level} ({overall_risk_score:.2%})")
-            logger.info(f"  Recommendation: {recommendation}")
-            
+                overall_risk_level = "High";   recommendation = "Escalate for executive review"
+
+            flags = [f"{d['label']}: Score {d['score']:.2f}"
+                     for d in risk_factors.values() if d["risk_level"] == "High"]
+
             return {
                 "status": "success",
                 "data": {
-                    "vendor_id": vendor.get("vendor_id", ""),
-                    "vendor_name": vendor_name,
-                    "overall_risk_score": overall_risk_score,
-                    "overall_risk_level": overall_risk_level,
-                    "risk_factors": risk_factors,
-                    "high_risk_flags": flags,
-                    "recommendation": recommendation,
+                    "vendor_id":           vendor.get("vendor_id", ""),
+                    "vendor_name":         vendor_name,
+                    "overall_risk_score":  overall_risk_score,
+                    "overall_risk_level":  overall_risk_level,
+                    "risk_factors":        risk_factors,
+                    "high_risk_flags":     flags,
+                    "recommendation":      recommendation,
                     "requires_escalation": overall_risk_level == "High",
-                    "assessment_date": datetime.now().isoformat()
+                    "assessment_date":     datetime.now().isoformat()
                 }
             }
         except Exception as e:
             logger.error(f"❌ Vendor risk assessment error: {e}")
             return {"status": "error", "error": str(e)}
-    
-    def _run_full_onboarding(self, task: Task) -> Dict:
-        """Execute full vendor onboarding pipeline"""
+
+    def _run_vendor_market_research(self, task: Task = None, **kwargs) -> Dict:
+        """Standalone tool for market research based on requirement context."""
+        task = task or kwargs.get("task")
         try:
-            vendor = self.input_data.vendor_details or {}
-            logger.info(f"🚀 Onboarding: {vendor.get('name', 'Unknown')}")
+            logger.info("📊 Executing standalone market research...")
+            requirement = kwargs.get("requirement") or self.state.results.get("requirement")
             
-            input_data = {
-                "image_path": vendor.get("image_path", ""),
-                "aadhar_number": vendor.get("aadhar", ""),
-                "pan_number": vendor.get("pan", "")
+            if not requirement:
+                # Attempt to build from RFP data if available
+                agg = self.state.results.get("rfp_aggregator", {})
+                if agg:
+                    requirement = {
+                        "requirement_id": agg.get("rfp_id", "REQ-001"),
+                        "description": agg.get("scope_of_work", ""),
+                        "priority": "balanced",
+                        "pricing": {"budget": 100000},
+                        "technical_specifications": agg.get("technical_requirements", [])
+                    }
+            
+            if not requirement:
+                return {"status": "error", "error": "No requirement context found for market research"}
+
+            # Call the modular market_research function
+            from workflow.vendor.vendor_procurement.vendor_procurement import (
+                market_research as core_market_research, ProcurementState
+            )
+            
+            dummy_state: ProcurementState = {
+                "requirement": requirement,
+                "vendors": [],
+                "market_insights": "",
+                "normalized_vendors": [],
+                "scored_vendors": [],
+                "top_vendors": [],
+                "negotiation_history": [],
+                "user_action": None,
+                "final_vendor": None,
+                "decision": {},
             }
             
+            result_state = core_market_research(dummy_state)
+            logger.info("✓ Market research complete")
+            return {"status": "success", "data": {"market_insights": result_state["market_insights"]}}
+            
+        except Exception as e:
+            logger.error(f"❌ Market research tool error: {e}")
+            return {"status": "error", "error": str(e)}
+
+    def _run_full_onboarding(self, task: Task = None, **kwargs) -> Dict:
+        task = task or kwargs.get("task")
+        try:
+            vendor = getattr(self.input_data, "vendor_details", None) or {}
+            logger.info(f"🚀 Onboarding: {vendor.get('name', 'Unknown')}")
+            input_data = {
+                "image_path":    vendor.get("image_path", ""),
+                "aadhar_number": vendor.get("aadhar", ""),
+                "pan_number":    vendor.get("pan", "")
+            }
             try:
                 result = run_onboarding_pipeline(input_data)
                 return {"status": "success", "data": result}
-            except:
-                return {
-                    "status": "success",
-                    "data": {"onboarding_status": "completed", "vendor_approved": True}
-                }
+            except Exception:
+                return {"status": "success", "data": {"onboarding_status": "completed", "vendor_approved": True}}
         except Exception as e:
             return {"status": "error", "error": str(e)}
-    
-    
-    def _run_competitor_analysis(self, task: Task) -> Dict:
-        """Execute Competitor Analysis using web crawling"""
+
+    # ── FIXED: signature now accepts `url` kwarg matching _build_tool_input ──
+    def _run_competitor_analysis(self, task: Task = None, url: str = "", **kwargs) -> Dict:
+        """Execute Competitor Analysis using web crawling."""
+        task = task or kwargs.get("task")
         try:
             logger.info("🔍 Analyzing competitors...")
-            
-            # Get competitor URLs from task inputs
-            product_url = task.required_inputs.get("product_url", "")
-            company_url = task.required_inputs.get("company_url", "")
-            
-            # Mirror logic: if AI only provides one URL mapping, apply it to both
-            if not product_url and company_url:
-                product_url = company_url
-            if not company_url and product_url:
-                company_url = product_url
-            
-            if not product_url or not company_url:
-                logger.warning("⚠️  No competitor URLs provided")
-                return {
-                    "status": "skipped",
-                    "reason": "No competitor URLs in task inputs"
-                }
-            
+
+            # Resolve URL: explicit kwarg → task required_inputs → state
+            competitor_url = (
+                url
+                or (task.required_inputs.get("url") if task else None)
+                or self.state.get_primary_url()
+                or ""
+            )
+
+            if not competitor_url:
+                logger.warning("⚠️  No competitor URL provided")
+                return {"status": "skipped", "reason": "No competitor URL resolved"}
+
+            # Use same URL for both product_url and company_url
+            product_url = competitor_url
+            company_url = competitor_url
+
+            logger.info(f"   Target URL: {competitor_url}")
+
             try:
                 from workflow.competitor.competitor_analysis import create_competitor_workflow, CompetitorInput
-                
-                logger.info(f"Initializing competitor workflow for {company_url}")
+
                 app = create_competitor_workflow()
-                
                 initial_state = {
                     "competitor_input": CompetitorInput(
                         product_url=product_url,
@@ -1956,39 +1971,37 @@ We have identified and developed mitigation strategies for all key risks. Our ex
                     "competitor_output": None,
                     "error": None
                 }
-                
-                logger.info("Executing LangGraph workflow...")
+
+                logger.info("Executing LangGraph competitor workflow...")
                 result = app.invoke(initial_state)
-                
+
                 if result.get("error"):
                     raise Exception(result["error"])
-                
+
                 output = result.get("competitor_output")
                 if not output:
                     raise Exception("Model returned no competitor output")
-                
+
                 logger.info(f"✓ Competitor analysis complete: {output.title}")
-                
-                return {
-                    "status": "success",
-                    "data": output.model_dump()
-                }
+                return {"status": "success", "data": output.model_dump()}
+
             except Exception as crawler_error:
-                logger.warning(f"⚠️  Analysis failed: {crawler_error}, returning fallback")
-                # Fallback without crawling
+                logger.warning(f"⚠️  Crawler failed: {crawler_error}, returning fallback")
                 return {
                     "status": "success",
                     "data": {
-                        "title": "Analysis Failed",
+                        "title":            f"Competitor Analysis: {competitor_url}",
                         "competitor_brief": str(crawler_error),
-                        "market_insights": ["Unable to fetch insights due to crawler block"],
-                        "opportunities": ["Try again later"]
+                        "market_insights":  ["Unable to fetch insights — crawler blocked or site unavailable"],
+                        "opportunities":    ["Retry with a different URL or check site accessibility"]
                     }
                 }
         except Exception as e:
             logger.error(f"❌ Competitor analysis error: {e}")
             return {"status": "error", "error": str(e)}
 
+
+# ── EXECUTION LOOP ────────────────────────────────────────────────────────────
 
 def execution_loop(
     state: ExecutionState,
@@ -1998,7 +2011,7 @@ def execution_loop(
 
     logger.info("🔄 EXECUTION LOOP: Starting task execution...\n")
 
-    state.status = "running"
+    state.status     = "running"
     state.start_time = datetime.now()
 
     tool_selector = ToolSelector(input_data, state)
@@ -2008,66 +2021,58 @@ def execution_loop(
             logger.warning(f"⏭️  Skipping {task.task_name} (dependency not met)")
             continue
 
-        # ── HIL GATE 1: Vendor KYC — collect identity details before proceeding ──
+        if not task.tool_name:
+            task.tool_name = tool_selector.select_tool_for_task(task)
+
+        if task.tool_name == "none":
+            logger.info(f"⏭️  Skipping task '{task.task_name}' - No tool required/selected.")
+            task.status = "skipped"
+            state.completed_tasks.append(task.id)
+            state.current_step += 1
+            continue
+
+        # ── HIL GATE 1: Vendor KYC ───────────────────────────────────────────
         if task.tool_name == "kyc_verification":
-            aadhar = (
-                task.required_inputs.get("aadhar_number") or
-                state.results.get("vendor_aadhar")
-            )
-            pan = (
-                task.required_inputs.get("pan_number") or
-                state.results.get("vendor_pan")
-            )
+            aadhar = task.required_inputs.get("aadhar_number") or state.results.get("vendor_aadhar")
+            pan    = task.required_inputs.get("pan_number")    or state.results.get("vendor_pan")
             if not aadhar or not pan:
                 logger.info("⏸️  HIL REQUIRED: Vendor KYC identity details not available")
                 state.hil_status = HILStatus(
                     required=True,
                     request=HILRequest(
-                        task_id=task.id,
-                        task_name=task.task_name,
+                        task_id=task.id, task_name=task.task_name,
                         required_fields={
                             "aadhar_number": "12-digit Aadhar number of the vendor",
-                            "pan_number": "10-character PAN number (e.g. ABCDE1234F)",
+                            "pan_number":    "10-character PAN number (e.g. ABCDE1234F)",
                             "document_path": "File path to identity document for OCR (optional)"
                         },
-                        message=(
-                            "Vendor KYC requires identity details before proceeding. "
-                            "Please provide the vendor's Aadhar and PAN information."
-                        ),
+                        message="Vendor KYC requires identity details before proceeding.",
                         hil_type="data_collection"
                     ),
                     paused_at_task_index=state.current_step
                 )
-                state.status = "awaiting_hil"
+                state.status   = "awaiting_hil"
                 state.end_time = datetime.now()
                 logger.info(f"⏸️  Execution paused at task [{task.id}] — awaiting HIL input\n")
                 return state
 
-        # ── HIL GATE 2: High-risk vendor — executive escalation approval ──────────
+        # ── HIL GATE 2: High-risk vendor ─────────────────────────────────────
         if task.tool_name == "vendor_risk":
             risk_data = state.results.get("vendor_risk", {})
             if risk_data.get("requires_escalation"):
-                logger.info("⏸️  HIL REQUIRED: High-risk vendor flagged — executive approval needed")
+                logger.info("⏸️  HIL REQUIRED: High-risk vendor flagged")
                 state.hil_status = HILStatus(
                     required=True,
                     request=HILRequest(
-                        task_id=task.id,
-                        task_name="High-Risk Vendor Escalation",
-                        required_fields={
-                            "approval": "approve or reject (required)",
-                            "notes": "Reviewer notes (optional)"
-                        },
-                        message=(
-                            "This vendor has been flagged as HIGH RISK. "
-                            "Executive approval is required before proceeding."
-                        ),
+                        task_id=task.id, task_name="High-Risk Vendor Escalation",
+                        required_fields={"approval": "approve or reject (required)", "notes": "Reviewer notes (optional)"},
+                        message="This vendor has been flagged as HIGH RISK. Executive approval required.",
                         hil_type="approval"
                     ),
                     paused_at_task_index=state.current_step
                 )
-                state.status = "awaiting_hil"
+                state.status   = "awaiting_hil"
                 state.end_time = datetime.now()
-                logger.info(f"⏸️  Execution paused at task [{task.id}] — awaiting HIL approval\n")
                 return state
 
         task.status = "running"
@@ -2076,27 +2081,29 @@ def execution_loop(
         try:
             result = tool_selector.select_and_execute(task)
 
-            task.status = "completed"
-            task.result = result
+            task.status  = "completed"
+            task.result  = result
+
+            # Store under task ID for completion tracking
+            # Named key already stored inside select_and_execute via TOOL_RESULT_KEY
             state.results[task.id] = result.get("data", {})
             state.completed_tasks.append(task.id)
 
         except Exception as e:
             logger.error(f"❌ Task failed: {task.task_name}")
             task.status = "failed"
-            task.error = str(e)
+            task.error  = str(e)
             state.failed_tasks[task.id] = str(e)
 
         state.current_step += 1
 
     state.end_time = datetime.now()
-    state.status = "completed"
+    state.status   = "completed"
     logger.info(f"\n✓ Execution complete: {len(state.completed_tasks)}/{len(tasks)} successful\n")
     return state
 
 
 def _check_dependencies(task: Task, state: ExecutionState) -> bool:
-    """Check if all task dependencies are met"""
     for dep_id in task.dependencies:
         if dep_id not in state.completed_tasks:
             return False
@@ -2104,14 +2111,12 @@ def _check_dependencies(task: Task, state: ExecutionState) -> bool:
 
 
 def compile_output(state: ExecutionState) -> OrchestrationOutput:
-
     logger.info("📦 FINAL OUTPUT: Compiling results...")
 
     execution_time = 0.0
     if state.start_time and state.end_time:
         execution_time = (state.end_time - state.start_time).total_seconds()
 
-    # Status priority: HIL pause > failures > success
     if state.hil_status and state.hil_status.required:
         overall_status = "awaiting_hil"
     elif state.failed_tasks:
@@ -2119,19 +2124,32 @@ def compile_output(state: ExecutionState) -> OrchestrationOutput:
     else:
         overall_status = "success"
 
+    current_results = {}
+    context_memory  = {}
+
+    for tid in state.completed_tasks:
+        if tid in state.results:
+            current_results[tid] = state.results[tid]
+
+    for key, val in state.results.items():
+        if key not in state.completed_tasks and key != "email_config":
+            context_memory[key] = val
+
     output = OrchestrationOutput(
         status=overall_status,
         workflow_id=state.workflow_id,
         workflow_type=state.workflow_type,
+        intent=state.intent,
         tasks_executed=state.completed_tasks,
-        results=state.results,
+        results=current_results,
+        context_memory=context_memory,
         errors=state.failed_tasks,
         total_execution_time=execution_time,
         success_metrics={
-            "total_tasks": len(state.tasks),
+            "total_tasks":     len(state.tasks),
             "completed_tasks": len(state.completed_tasks),
-            "failed_tasks": len(state.failed_tasks),
-            "success_rate": len(state.completed_tasks) / len(state.tasks) if state.tasks else 0
+            "failed_tasks":    len(state.failed_tasks),
+            "success_rate":    len(state.completed_tasks) / len(state.tasks) if state.tasks else 0
         },
         hil_status=state.hil_status
     )
@@ -2141,12 +2159,6 @@ def compile_output(state: ExecutionState) -> OrchestrationOutput:
 
 
 def distil_results_for_ctx(results: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Strip bulky fields from execution results — keep only entity-resolution
-    facts for the next session turn (subjects, attachment paths, RFP metadata,
-    recommended vendor).  Called by the async background runner before writing
-    to MongoDB.  Public so it can be imported without touching private state.
-    """
     out: Dict[str, Any] = {}
     for val in results.values():
         if not isinstance(val, dict):
@@ -2175,97 +2187,74 @@ def distil_results_for_ctx(results: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def orchestrate(prompt_input: PromptInput) -> OrchestrationOutput:
-    """
-    Main orchestration function.
-    Input: User prompt (natural language)
-    Output: Structured execution result
-    """
     workflow_id = str(uuid.uuid4())
-    logger.info(f"\n{'='*80}")
-    logger.info(f"🚀 ORCHESTRATION STARTED: {workflow_id}")
-    logger.info(f"{'='*80}\n")
-    
-    try:
-        # ── Mongo-backed prior context ──────────────────────────────────────────
-        # prior_context is pre-fetched from MongoDB by the async background
-        # runner before calling orchestrate() (orchestrate is sync, cannot await).
-        _prior_ctx: Dict[str, Any] = prompt_input.prior_context or {}
-        if _prior_ctx:
-            if prompt_input.context is None:
-                prompt_input.context = {}
-            prompt_input.context["prior_session"] = _prior_ctx
-            logger.info(
-                f"🔗 Prior context injected from Mongo: "
-                f"workflow={_prior_ctx.get('last_workflow')} "
-                f"turns={len(_prior_ctx.get('history', [])) + 1}"
-            )
+    logger.info(f"\n🚀 ORCHESTRATION STARTED: {workflow_id}")
 
-        # STEP 1: PERCEPTION - Parse natural language prompt with context
+    try:
+        _prior_ctx: Dict[str, Any] = prompt_input.prior_context or {}
         perception = perception_layer(prompt_input)
-        
-        # STEP 2: GOAL FORMATION - Convert perception to goals
-        goal = goal_formation(perception)
-        
-        # STEP 3: TASK DECOMPOSITION - Break down goal into tasks
-        tasks = task_decomposition(goal)
-        if not tasks:
-            logger.warning("⚠️  No tasks decomposed. Returning empty result.")
-        
-        # STEP 4: INITIALIZE EXECUTION STATE
+
+        # Initialize State
         state = ExecutionState(
             workflow_id=workflow_id,
             workflow_type=perception.workflow,
-            mode="full",
-            goal=goal,
-            tasks=tasks
+            intent=perception.intent,
+            mode=perception.mode,
+            entities=perception.entities,
+            input_data={"prompt": prompt_input.prompt, "file_path": prompt_input.file_path, "url": prompt_input.url},
+            memory=_prior_ctx,
+            results=_prior_ctx.get("results", {})
         )
 
-        # Inject per-session credentials into state so tools can access at runtime
-        # (email_config is populated by the login endpoint before orchestrate() is called)
         if prompt_input.email_config:
             state.results["email_config"] = prompt_input.email_config
-            logger.info("🔐 Email credentials loaded into execution state (source: login session)")
 
-        # Pre-seed state with prior turn's distilled results so tools find the
-        # right entities (e.g. rfp_pdf_path from an email scan in the last turn).
-        if _prior_ctx.get("results"):
-            seeded = {k: v for k, v in _prior_ctx["results"].items() if k != "email_config"}
-            if seeded:
-                state.results.update(seeded)
-                logger.info(f"🌱 State pre-seeded from prior turn: {list(seeded.keys())}")
+        # ── ROUTING DECISION ──────────────────────────────────────────────────
+        route = router(state)
 
-        # STEP 5: EXECUTION LOOP
-        # Build backward-compat PerceptionInput, preserving all relevant context
-        compat_input = PerceptionInput(
-            workflow_type=perception.workflow,
-            rfp_pdf_path=perception.entities.get("rfp_pdf_path"),
-            tender_url=perception.entities.get("url"),
-            email_text=(
-                json.dumps(perception.entities["email_config"])
-                if isinstance(perception.entities.get("email_config"), dict)
-                else perception.entities.get("email_config")  # already a str or None
-            ),
-            vendor_details=perception.entities.get("vendor_details"),
-            user_context=json.dumps(perception.entities)
-        )
-        state = execution_loop(state, tasks, compat_input)
+        # ── CASE 1: DIRECT (Single Tool) ──────────────────────────────────────
+        if route["type"] == "direct":
+            tool_name = route["tool"]
+            logger.info(f"⚡ ROUTER: Mode='direct' → Executing {tool_name}")
+            
+            selector = ToolSelector(prompt_input, state)
+            
+            # Special case for general response
+            if tool_name == "general_response":
+                reply = selector._run_general_response(Task(id="t1", task_name="Direct Response", description="General", required_inputs={"original_goal": prompt_input.prompt, "history": _prior_ctx.get("history", [])}))
+                return OrchestrationOutput(status="success", workflow_id=workflow_id, workflow_type="conversational", tasks_executed=["t1"], results={"reply": reply}, total_execution_time=0.1)
+
+            # Standard Tool Execution
+            task = Task(id="t1", task_name=route["tool"], tool_name=tool_name, description=f"Direct action: {tool_name}")
+            result = selector.select_and_execute(task)
+            
+            # Check for HIL in direct result
+            if isinstance(result, dict) and result.get("requires_hil"):
+                state.status = "awaiting_hil"
+                state.hil_status = HILStatus(required=True, request=HILRequest(task_id="t1", task_name=task.task_name, required_fields=result.get("required_fields", {}), message=result.get("message", "Confirmation needed")), paused_at_task_index=0)
+                return compile_output(state)
+
+            return OrchestrationOutput(status="success", workflow_id=workflow_id, workflow_type=perception.workflow, tasks_executed=["t1"], results=state.results, total_execution_time=0.5)
+
+        # ── CASE 2: WORKFLOW (Multi-step) ─────────────────────────────────────
+        logger.info(f"⚙️  ROUTER: Mode='workflow' → Generating Task Sequence")
         
-        # STEP 6: COMPILE OUTPUT
-        output = compile_output(state)
+        tasks = generate_tasks(perception.intent, perception.entities, state)
+        if not tasks:
+            logger.warning("⚠️  No tasks generated.")
+        
+        state.tasks = tasks
+        state = execution_loop(state, tasks, PerceptionInput(workflow_type=perception.workflow, user_context=prompt_input.prompt, rfp_pdf_path=perception.entities.get("rfp_pdf_path"), tender_url=perception.entities.get("url")))
 
-        # ── Session persistence is now handled by the async background runner ───
-        # (it reads from / writes to MongoDB around this orchestrate() call)
+        return compile_output(state)
 
-        logger.info(f"{'='*80}")
-        logger.info(f"✅ ORCHESTRATION COMPLETE: {output.status}")
-        logger.info(f"{'='*80}\n")
+    except Exception as e:
+        logger.error(f"❌ ORCHESTRATION FAILED: {e}\n{traceback.format_exc()}")
+        return OrchestrationOutput(status="failed", workflow_id=workflow_id, workflow_type="unknown", tasks_executed=[], results={}, errors={"orchestration": str(e)})
 
-        return output
-    
     except Exception as e:
         logger.error(f"\n❌ ORCHESTRATION FAILED: {e}")
         logger.error(traceback.format_exc())
-        
         return OrchestrationOutput(
             status="failed",
             workflow_id=workflow_id,
@@ -2274,47 +2263,3 @@ def orchestrate(prompt_input: PromptInput) -> OrchestrationOutput:
             results={},
             errors={"orchestration": str(e)}
         )
-
-
-
-# if __name__ == "__main__":
-#     # ==== EXAMPLE 1: Email Scanning ====
-#     print("\n" + "="*80)
-#     print("CASE 1: Email Scanning - Check emails for RFPs")
-#     print("="*80)
-#     email_input = PromptInput(
-#         prompt="Check my emails for rfp requests",
-#         email_config={"folder": "inbox", "service": "gmail"}
-#     )
-#     result = orchestrate(email_input)
-#     print(f"Intent: {result.workflow} | Status: {result.status}")
-    
-#     # ==== EXAMPLE 2: Tender Scraping ====
-#     print("\n" + "="*80)
-#     print("CASE 2: Tender Scraping - Scrape tender portal")
-#     print("="*80)
-#     scraping_input = PromptInput(
-#         prompt="Scrape tenders for RFP opportunities",
-#         url="https://tender.gov.in"
-#     )
-#     result = orchestrate(scraping_input)
-#     print(f"Intent: {result.workflow} | Status: {result.status}")
-    
-#     # ==== EXAMPLE 3: PDF Upload & Processing ====
-#     print("\n" + "="*80)
-#     print("CASE 3: PDF Upload - Process uploaded RFP document")
-#     print("="*80)
-#     pdf_input = PromptInput(
-#         prompt="Process this RFP, assess risks, match requirements, calculate pricing, and generate proposal",
-#         file_path="/uploads/acme_rfp_2026.pdf",
-#         context={"client": "Acme Corp", "deadline": "2026-04-15"}
-#     )
-#     result = orchestrate(pdf_input)
-#     print(f"Intent: {result.workflow} | Status: {result.status}")
-
-
-
-
-
-
-

@@ -1,26 +1,13 @@
-from transformers import AutoTokenizer, AutoModelForTokenClassification, pipeline
+import os
+import json
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_core.prompts import PromptTemplate
-from langchain_community.document_loaders import TextLoader
 from langgraph.graph import StateGraph, START, END
-from typing import TypedDict, List, Optional
+from typing import TypedDict, List, Optional, Dict
 from pydantic import BaseModel
 from dotenv import load_dotenv
-import os
 
 load_dotenv()
-
-NER_MODEL = "dslim/bert-base-NER"
-
-tokenizer = AutoTokenizer.from_pretrained(NER_MODEL)
-model = AutoModelForTokenClassification.from_pretrained(NER_MODEL)
-ner = pipeline(
-    "token-classification",
-    model=model,
-    tokenizer=tokenizer,
-    aggregation_strategy="simple"
-)
 llm = ChatGoogleGenerativeAI(
     model="gemini-2.0-flash",
     temperature=0.2,
@@ -46,123 +33,70 @@ def read_text_file(state: RiskAndComplianceState) -> RiskAndComplianceState:
 
 def split_text(state: RiskAndComplianceState) -> RiskAndComplianceState:
     """Split long text into manageable chunks."""
-    if not state['chunked_text']:
+    if not state.get('chunked_text') and state.get('parsed_text'):
         splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=150
+            chunk_size=20000, # Gemini optimized context
+            chunk_overlap=500
         )
-        chunks = splitter.split_text(state['parsed_text'])
-        state['chunked_text'] = chunks
+        state['chunked_text'] = splitter.split_text(state['parsed_text'])
     return state
 
-def ner_legal_bert(state: RiskAndComplianceState) -> RiskAndComplianceState:
-    """Extract ALL legal entities using Legal-BERT. No filtering."""
-
-    extracted_entities = []
-    discovered_groups = set()
-
-    for chunk in state["chunked_text"]:
-        entities = ner(chunk)
-        for ent in entities:
-            group = ent["entity_group"]
-            word = ent["word"]
-            extracted_entities.append(f"{group}: {word}")
-            discovered_groups.add(group)
-
-    state['legal_risks'] = extracted_entities if extracted_entities else None
-    return state
-
-def generate_report(state: RiskAndComplianceState) -> RiskAndComplianceState:
-    """Summarize extracted legal entities and assess risk with all risks and compliance stated."""
-
+def analyze_risk_compliance(state: RiskAndComplianceState) -> RiskAndComplianceState:
+    """Unified extraction of risks and compliance using Gemini 2.0."""
+    context = "\n".join(state.get('chunked_text', [])) or state.get('parsed_text', "")
+    
     prompt = f"""
-    You are a senior legal and compliance expert.
+    You are a high-level Legal & Compliance analyst for an industrial OEM.
+    Analyze the provided RFP text for critical business risks and regulatory compliance markers.
 
-    These are the extracted legal entities:
-    {state['legal_risks']}
+    TEXT CONTENT:
+    {context[:5000]}
 
     TASK:
-    - List ALL potential legal/compliance risks identified in the document.
-    - List ALL compliance requirements mentioned.
-    - Identify risky clauses (e.g., indemnity, liability, warranty, penalties).
-    - Assign a flagging score between 0 and 1 (where 1 is highest risk).
-    
-    Return ONLY valid JSON:
+    1. EXTRACT ALL RISKS: Liability limits, indemnity gaps, penalty clauses, payment term risks.
+    2. EXTRACT COMPLIANCE: ISO standards, environmental certifications, safety protocols, local laws.
+    3. FLAG: Overall risk score (0.0 to 1.0).
+
+    RETURN ONLY VALID JSON:
     {{
-      "all_risks": ["risk1", "risk2", ...],
-      "all_compliance": ["compliance1", "compliance2", ...],
-      "summary": "...",
+      "all_risks": ["Risk list"],
+      "all_compliance": ["Compliance list"],
+      "summary": "High-level brief (3-5 bullets)",
       "flagging_score": 0.0
     }}
     """
-
-    response = llm.invoke(prompt).content
-    state["report"] = response
-    return state
-
-def access_risk(state: RiskAndComplianceState) -> RiskAndComplianceState:
-    """Extract flagging score and all risks/compliance from the JSON report."""
-    import json
-
+    
     try:
-        parsed = json.loads(state["report"])
-        score = float(parsed.get("flagging_score", parsed.get("severity", 0.0)))
-        all_risks = parsed.get("all_risks", [])
-        all_compliance = parsed.get("all_compliance", [])
+        response = llm.invoke(prompt)
+        data = json.loads(response.content.strip().strip('```json').strip('```'))
         
-        # Update legal_risks to include all risks and compliance
-        combined_risks = []
-        if all_risks:
-            combined_risks.extend([f"RISK: {r}" for r in all_risks])
-        if all_compliance:
-            combined_risks.extend([f"COMPLIANCE: {c}" for c in all_compliance])
-        if combined_risks:
-            state['legal_risks'] = combined_risks
-    except:
-        score = 0.5  
-
-    state["flagging_score"] = score
-    return state
-
-def generate_risk_brief(state: RiskAndComplianceState) -> RiskAndComplianceState:
-    """Generate a short risk brief for final output."""
-
-    prompt = f"""
-    Create a very concise Risk Brief based on:
-
-    Report:
-    {state['report']}
-
-    Severity Score: {state['flagging_score']}
-
-    Requirements:
-    - 3–5 bullet points
-    - High-level summary
-    - Identified risks
-    - Overall risk verdict
-    """
-
-    response = llm.invoke(prompt).content
-    state["risk_brief"] = response
+        state['risk_brief'] = data.get("summary", "")
+        state['flagging_score'] = data.get("flagging_score", 0.0)
+        
+        combined = []
+        combined.extend([f"RISK: {r}" for r in data.get("all_risks", [])])
+        combined.extend([f"COMPLIANCE: {c}" for c in data.get("all_compliance", [])])
+        state['legal_risks'] = combined
+        
+        state['report'] = json.dumps(data)
+        
+    except Exception as e:
+        print(f"Risk analysis failed: {e}")
+        state['legal_risks'] = []
+        state['flagging_score'] = 0.5
+        
     return state
 
 graph = StateGraph(RiskAndComplianceState)
 
 graph.add_node("read_text_file", read_text_file)
 graph.add_node("split_text", split_text)
-graph.add_node("ner_legal_bert", ner_legal_bert)
-graph.add_node("generate_report", generate_report)
-graph.add_node("access_risk", access_risk)
-graph.add_node("generate_risk_brief", generate_risk_brief)
+graph.add_node("analyze_risk_compliance", analyze_risk_compliance)
 
 graph.add_edge(START, "read_text_file")
 graph.add_edge("read_text_file", "split_text")
-graph.add_edge("split_text", "ner_legal_bert")
-graph.add_edge("ner_legal_bert", "generate_report")
-graph.add_edge("generate_report", "access_risk")
-graph.add_edge("access_risk", "generate_risk_brief")
-
-graph.add_edge("generate_risk_brief", END)
+graph.add_edge("split_text", "analyze_risk_compliance")
+graph.add_edge("analyze_risk_compliance", END)
 
 app = graph.compile()
 

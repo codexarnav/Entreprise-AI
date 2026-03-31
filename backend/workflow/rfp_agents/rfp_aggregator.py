@@ -1,7 +1,9 @@
 from langgraph.graph import StateGraph,START,END
 from pydantic import BaseModel
 from typing import TypedDict,List,Optional,Annotated,Dict
-from transformers import AutoTokenizer,AutoModelForQuestionAnswering,pipeline
+import os
+import json
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_community.document_loaders import TextLoader,PyMuPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from dotenv import load_dotenv
@@ -11,10 +13,10 @@ load_dotenv()
 
 
 class RfpAggregatorInput(BaseModel):
-    text_path:str
-    pdf_path:Optional[str]
-    documents:Optional[List[str]]
-    chunked_text:Optional[List[str]]
+    text_path: Optional[str] = None
+    pdf_path: Optional[str] = None
+    documents: Optional[List[str]] = None
+    chunked_text: Optional[List[str]] = None
 class RfpAggregatorOutput(BaseModel):
     rfp_id:int
     title:str
@@ -27,69 +29,110 @@ class RfpAggregatorState(TypedDict):
     rfp_aggregator_input:RfpAggregatorInput
     rfp_aggregator_output:Optional[RfpAggregatorOutput]
 
-tokenizer=AutoTokenizer.from_pretrained("deepset/roberta-base-squad2")
-model=AutoModelForQuestionAnswering.from_pretrained("deepset/roberta-base-squad2")
-ner=pipeline(
-    "question-answering",
-    model=model,
-    tokenizer=tokenizer
-)
+def get_llm():
+    return ChatGoogleGenerativeAI(
+        model="gemini-2.0-flash",
+        temperature=0.1,
+        api_key=os.getenv("GEMINI_API_KEY")
+    )
 
 def document_loader(state:RfpAggregatorState)->RfpAggregatorState:
-    """Load document from file path"""
-    if state['rfp_aggregator_input'].pdf_path:
-        loader=PyMuPDFLoader(state['rfp_aggregator_input'].pdf_path)
+    """Load document from file path with robust path resolution"""
+    path = state['rfp_aggregator_input'].pdf_path or state['rfp_aggregator_input'].text_path
+    
+    if not path:
+        raise ValueError("No document path provided to loader")
+        
+    # Robust Path Resolution: Handle Linux-style absolute paths on Windows
+    if path.startswith('/') and not path.startswith('//'):
+        # Use abs path of project root to map /uploads/
+        project_root = os.path.abspath(os.getcwd())
+        if path.startswith('/uploads/'):
+            path = os.path.join(project_root, "uploads", os.path.basename(path))
+        else:
+            path = os.path.join(project_root, path.lstrip('/'))
+            
+    if not os.path.exists(path):
+        # Final fallback check in current directory
+        if os.path.exists(os.path.basename(path)):
+            path = os.path.abspath(os.path.basename(path))
+        else:
+            raise FileNotFoundError(f"RFP Document not found at {path}")
+
+    if path.lower().endswith('.pdf'):
+        loader = PyMuPDFLoader(path)
     else:
-        loader=TextLoader(state['rfp_aggregator_input'].text_path)
-    documents=loader.load()
-    state['rfp_aggregator_input'].documents=[doc.page_content for doc in documents]
+        loader = TextLoader(path)
+        
+    documents = loader.load()
+    state['rfp_aggregator_input'].documents = [doc.page_content for doc in documents]
     return state
 
 def chunks(state:RfpAggregatorState)->RfpAggregatorState:
     """Split long text into manageable chunks."""
     splitter=RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=150
+        chunk_size=10000, # Increased for Gemini
+        chunk_overlap=500
     )
+    all_chunks = []
     for doc in state['rfp_aggregator_input'].documents:
         doc_chunks=splitter.split_text(doc)
-    state['rfp_aggregator_input'].chunked_text=doc_chunks
+        all_chunks.extend(doc_chunks)
+    
+    state['rfp_aggregator_input'].chunked_text = all_chunks
     return state
 
 
 def rfp_aggregator_ner(state:RfpAggregatorState)->RfpAggregatorState:
-    """Extract Rfp details using deepset/roberta"""
-    rfp_text="".join(state['rfp_aggregator_input'].chunked_text)
-    questions={
-        "title":"What is the title of the RFP?",
-        "buyer":"Who is the buyer?",
-        "deadline":"What is the deadline? Provide in epoch format.",
-        "technical_requirements":"List the technical requirements mentioned.",
-        "scope_of_work":"What is the scope of work?"
-    }
-    rfp_details={}
-    for key,question in questions.items():
-        answer=ner(question=question,context=rfp_text)
-        rfp_details[key]=answer['answer']
-
+    """Extract RFP details using Gemini 2.0 with JSON formatting."""
+    full_text = "\n\n".join(state['rfp_aggregator_input'].chunked_text)
+    llm = get_llm()
     
-    raw_deadline = rfp_details.get('deadline') or ""
+    prompt = f"""
+    You are an expert RFP Analyst. Extract structured data from the following RFP text.
+    
+    RFP TEXT:
+    {full_text[:5000]} # Gemini can handle more, but we truncate for performance if needed
+    
+    Output ONLY valid JSON in this format:
+    {{
+      "rfp_id": 1,
+      "title": "String",
+      "buyer": "String",
+      "deadline": "ISO format string or epoch",
+      "technical_requirements": ["list", "of", "strings"],
+      "scope_of_work": ["list", "of", "strings"]
+    }}
+    
+    Ensure `technical_requirements` captures specific hardware/software counts, SKUs, and performance specs.
+    Ensure `scope_of_work` captures timeline and deliverables.
+    """
+    
     try:
+        response = llm.invoke(prompt)
+        content = response.content.strip()
         
-        deadline_value = str(float(raw_deadline))
-    except Exception:
-        deadline_value = raw_deadline.strip()
-    rfp_output=RfpAggregatorOutput(
-        rfp_id=1,
-        title=rfp_details['title'],
-        buyer=rfp_details['buyer'],
-        deadline=deadline_value,
-        technical_requirements=[req.strip() for req in rfp_details['technical_requirements'].split(',')],
-        scope_of_work=[scope.strip() for scope in rfp_details['scope_of_work'].split(',')]
-    )
-    return state | {
-        "rfp_aggregator_output": rfp_output
-    }
+        # Strip markdown if present
+        if content.startswith("```"):
+            content = content.split("```")[1]
+            if content.startswith("json"):
+                content = content[4:]
+            content = content.split("```")[0].strip()
+            
+        data = json.loads(content)
+        
+        # Map to Output model
+        rfp_output = RfpAggregatorOutput(**data)
+        
+    except Exception as e:
+        print(f"Extraction failed: {e}")
+        # Fallback empty result
+        rfp_output = RfpAggregatorOutput(
+            rfp_id=0, title="Unknown", buyer="Unknown", deadline="",
+            technical_requirements=[], scope_of_work=[]
+        )
+
+    return {**state, "rfp_aggregator_output": rfp_output}
 
 graph=StateGraph(RfpAggregatorState)
 graph.add_node("document_loader", document_loader)

@@ -8,7 +8,9 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
+import shutil
+import os
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, File, UploadFile
 from fastapi.security import OAuth2PasswordBearer
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -40,6 +42,7 @@ app.include_router(auth_router)
 
 @app.on_event("startup")
 async def startup():
+    os.makedirs("uploads", exist_ok=True)
     await connect_db()
 
 
@@ -255,6 +258,27 @@ class ApproveReq(BaseModel):
 
 
 # ── Execution endpoints ───────────────────────────────────────────────────────
+
+@app.post("/upload", tags=["Execution"])
+async def upload_file(
+    file: UploadFile = File(...),
+    user: dict = Depends(get_current_user)
+):
+    """Save an uploaded file to the local uploads directory."""
+    try:
+        # Create uploads directory if not exists
+        os.makedirs("uploads", exist_ok=True)
+        
+        file_path = f"uploads/{file.filename}"
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+            
+        logger.info(f"✓ File uploaded: {file.filename} -> {file_path}")
+        return {"status": "success", "file_path": f"/{file_path}"}
+    except Exception as e:
+        logger.error(f"❌ Upload failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/execute", tags=["Execution"])
 async def execute(

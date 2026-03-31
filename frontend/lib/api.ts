@@ -4,7 +4,7 @@ const api = axios.create({
   baseURL: 'http://127.0.0.1:8000',
 });
 
-// Add a request interceptor to attach the Bearer token
+
 api.interceptors.request.use(
   (config) => {
     const token = localStorage.getItem('token');
@@ -18,7 +18,7 @@ api.interceptors.request.use(
   }
 );
 
-// Add a response interceptor for global error handling (e.g. 401 Unauthorized)
+
 api.interceptors.response.use(
   (response) => {
     return response;
@@ -37,5 +37,30 @@ api.interceptors.response.use(
     return Promise.reject(error);
   }
 );
+
+export const executeWorkflow = async (prompt: string, session_id?: string, file_path?: string, url?: string) => {
+  const { data } = await api.post('/execute', { prompt, session_id, file_path, url });
+  return data;
+};
+
+export const getWorkflowStatus = async (workflow_id: string) => {
+  const { data } = await api.get(`/workflow/${workflow_id}`);
+  return data;
+};
+
+export const getAuditLogs = async (workflow_id: string) => {
+  const { data } = await api.get(`/workflow/${workflow_id}/audit`);
+  return data;
+};
+
+export const resumeWorkflow = async (workflow_id: string, inputs: any) => {
+  const { data } = await api.post(`/workflow/${workflow_id}/resume`, { inputs });
+  return data;
+};
+
+export const approveWorkflow = async (workflow_id: string, approval: string, notes?: string) => {
+  const { data } = await api.post(`/workflow/${workflow_id}/approve`, { approval, notes });
+  return data;
+};
 
 export default api;
