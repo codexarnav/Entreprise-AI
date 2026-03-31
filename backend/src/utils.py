@@ -4,8 +4,8 @@ from jose import JWTError, jwt
 from datetime import datetime, timedelta
 from typing import Optional
 
-SECRET_KEY                = os.getenv("SECRET_KEY", "change_me_in_production")
-ALGORITHM                 = "HS256"
+SECRET_KEY = os.getenv("SECRET_KEY", "change_me_in_production")
+ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")

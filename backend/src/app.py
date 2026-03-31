@@ -274,7 +274,7 @@ async def upload_file(
             shutil.copyfileobj(file.file, buffer)
             
         logger.info(f"✓ File uploaded: {file.filename} -> {file_path}")
-        return {"status": "success", "file_path": f"/{file_path}"}
+        return {"status": "success", "file_path": file_path}
     except Exception as e:
         logger.error(f"❌ Upload failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -311,11 +311,17 @@ async def execute(
         "details":     {"prompt": req.prompt, "user": user.get("sub")},
         "timestamp":   now,
     })
+    
+    file_path = req.file_path.lstrip("/") if req.file_path else None
+
+    logger.info(f"🔥 RAW FILE PATH: {req.file_path}")
+    logger.info(f"✅ NORMALIZED FILE PATH: {file_path}")
 
     background_tasks.add_task(
         run_workflow, workflow_id, req.prompt, session_id, user,
-        None, req.file_path, req.url,
-    )
+        None, file_path, req.url,
+)
+    
     return {"workflow_id": workflow_id, "status": "started"}
 
 

@@ -206,11 +206,32 @@ export default function DiscussionsChatPage() {
     setIsLoading(true)
 
     try {
+      let filePath = undefined;
+
+      if (selectedFile) {
+        const formData = new FormData();
+        formData.append("file", selectedFile);
+
+        const uploadRes = await fetch("http://localhost:8000/upload", {
+          method: "POST",
+          body: formData,
+          headers: {
+            Authorization: `Bearer ${localStorage.getItem("token")}`
+          }
+        });
+
+        const uploadData = await uploadRes.json();
+
+        filePath = uploadData.file_path;
+
+        console.log("✅ Uploaded file path:", filePath);
+      }
+
       const res = await executeWorkflow(
         prompt,
         currentSessionId,
-        selectedFile ? `/uploads/${selectedFile.name}` : undefined
-      )
+        filePath
+      );
       setCurrentWorkflowId(res.workflow_id)
       setWorkflowStatus("running")
       startPolling(res.workflow_id)

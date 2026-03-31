@@ -32,8 +32,11 @@ from workflow.rfp_agents.proposal_weaver_agent import (
 from workflow.vendor.vendor_onboarding.vendor_onboarding import (
     run_onboarding_pipeline
 )
+
 from workflow.vendor.vendor_procurement.vendor_procurement import (
-    ProcurementState, market_research, normalize_vendors, scoring_engine
+    ProcurementState, market_research, normalize_vendors, scoring_engine,
+    select_top_vendors, negotiation_simulation, rescore_after_negotiation,
+    decision_engine, purchase_order_generation
 )
 from src.input_handlers.email_handler import process_unread_emails
 from src.input_handlers.tender_scraper import run_tender_scraper
@@ -240,7 +243,7 @@ USER PROMPT:
 LOCKED REGISTRY:
 | intent      | action                          |
 |-------------|---------------------------------|
-| rfp         | process_rfp / risk_analysis / technical_match / pricing_only / generate_proposal |
+| rfp         | process_rfp / risk_analysis / technical_match / pricing_only / generate_proposal / analyze |
 | procurement | list_vendors / evaluate_vendors / negotiate / vendor_risk / market_analysis |
 | onboarding  | run_onboarding / kyc / document_verification |
 | competitor  | competitor_analysis             |
@@ -251,15 +254,21 @@ LOCKED REGISTRY:
 RULES:
 1. GREETINGS/HELP: intent="conversational", mode="direct"
 2. WORKFLOW MODE (Multi-step):
-   - RFP: Trigger "workflow" ONLY if prompt is "analyze this rfp", "process this rfp", "give me a proposal for this", or similar full-flow requests.
-   - PROCUREMENT: Trigger "workflow" ONLY if prompt asks for "full procurement", "end-to-end vendors", etc.
+   - RFP: Trigger "workflow" ONLY for "process this rfp", "analyze this rfp", "prepare a full proposal for this", or other end-to-end requests.
+   - PROCUREMENT: Trigger "workflow" ONLY for "run full procurement", "source end-to-end vendors", etc.
    - ONBOARDING: Trigger "workflow" for "onboard this vendor" or "run full onboarding".
-3. DIRECT MODE (Single-step):
-   - Default to "direct" for specific queries like "list vendors", "evaluate them", "negotiate with X", "market behavior", "risk profile", "kyc X".
-4. RFP MAPPING: "risk" -> risk_analysis, "technical" -> technical_match, "price" -> pricing_only, "proposal" -> generate_proposal.
-5. PROCUREMENT MAPPING: "list" -> list_vendors, "evaluate" -> evaluate_vendors, "negotiate" -> negotiate, "risk" -> vendor_risk, "market" -> market_analysis.
-6. ENTITIES: Extract vendor_name, rfp_pdf_path, url, aadhar_number, negotiation_intent.
-7. CONTEXT RESOLUTION: Resolve "it", "this", "them" using [CONTEXT].
+3. DIRECT MODE (Single-tool):
+   - Default to "direct" for discrete actions: "list vendors", "negotiate price", "assess vendor risk", "market behavior", "risk profile", "kyc X", "analyze competitor X".
+4. FALLBACK WORKFLOW: 
+   - If the intent matches a known domain (rfp, procurement, etc.), always return a valid 'workflow' value (rfp|procurement|onboarding|competitor_analysis) even if mode is "direct".
+5. ACTION MAPPING: 
+   - "list vendors", "show me vendors" → action: list_vendors
+   - "evaluate", "score" → action: evaluate_vendors
+   - "negotiate", "reduce price" → action: negotiate
+   - "analyze risk", "risk check" → action: risk_analysis (rfp) or vendor_risk (prococurement)
+6. FOLLOW-UP CONTEXT: 
+   - If the user says "based on that," "from earlier," "using that vendor," or "negotiate with them," strictly map to the relevant 'action' and 'direct' mode.
+7. ENTITIES: Extract vendor_name, rfp_pdf_path, url, aadhar_number, negotiation_intent.
 
 OUTPUT JSON ONLY:
 {{
@@ -597,6 +606,18 @@ TOOL_RESULT_KEY = {
     "run_onboarding_pipeline": "run_onboarding_pipeline",
 }
 
+# ── PROCUREMENT: ACTION → FUNCTION CHAIN MAPPING ────────────────────────────
+PROCUREMENT_FUNCTION_FLOW: Dict[str, List[str]] = {
+    "list_vendors":     ["normalize_vendors", "scoring_engine", "select_top_vendors"],
+    "market_research":  ["market_research"],
+    "evaluate_vendors": ["normalize_vendors", "scoring_engine"],
+    "negotiate":        ["negotiation_simulation", "rescore_after_negotiation"],
+    "finalize":         ["decision_engine", "purchase_order_generation"],
+    "full_procurement": [
+        "market_research", "normalize_vendors", "scoring_engine",
+        "select_top_vendors", "decision_engine", "purchase_order_generation"
+    ],
+}
 
 # ── MAPPINGS FOR MODULAR EXECUTION ────────────────────────────────────────────
 
@@ -620,39 +641,66 @@ ACTION_TO_TOOL = {
 
 def router(state: ExecutionState) -> Dict[str, Any]:
     """
-    Precision Router: Maps intent + action + mode to either a single tool or a workflow.
-    Ensures that 'direct' mode runs exactly one capability.
+    Precision Router: intent + action + mode → single tool or workflow.
+    Procurement is always function-level (never full workflow unless explicitly requested).
     """
-    logger.info(f"🚦 ROUTER: Mode={state.mode}, Action={state.intent}.{state.entities.get('action')}")
-    
-    action = state.entities.get("action")
+    intent = state.intent.lower()
+    action = state.entities.get("action", "")
     mode   = state.mode
+    prompt = state.input_data.get("prompt", "").lower()
 
+    logger.info(f"🚦 ROUTER: Mode={mode}, Intent={intent}, Action={action}")
+
+    # Conversational fallback
+    if intent in ["conversational", "unknown"] and not action:
+        return {"type": "direct", "tool": "general_response"}
+
+    # ── PROCUREMENT: always function-level, never full workflow by default ──
+    if intent == "procurement":
+
+        # Infer action from prompt keywords when perception returns None
+        if not action:
+            if any(w in prompt for w in ["negotiate", "negotiat"]):
+                action = "negotiate"
+            elif any(w in prompt for w in ["market research", "market trend", "market insight", "market behav"]):
+                action = "market_research"
+            elif any(w in prompt for w in ["finalize", "purchase order", "generate po", "final decision"]):
+                action = "finalize"
+            elif any(w in prompt for w in ["evaluate", "score vendor"]):
+                action = "evaluate_vendors"
+            else:
+                # "vendors", "list vendors", "give me vendors", "show vendors" → default
+                action = "list_vendors"
+
+        # Full end-to-end only when explicitly asked
+        full_triggers = ["run vendor procurement", "run full procurement",
+                         "end to end procurement", "full procurement", "run procurement"]
+        if any(t in prompt for t in full_triggers) or mode == "workflow":
+            action = "full_procurement"
+
+        logger.info(f"   └─ Procurement action resolved: {action}")
+        return {"type": "direct", "tool": "procurement_functions", "action": action}
+
+    # ── ALL OTHER INTENTS ────────────────────────────────────────────────────
     if mode == "direct":
         tool = ACTION_TO_TOOL.get(action)
         if not tool:
-            # Fallback to intent-based tool if action is missing
-            if state.intent == "competitor": tool = "competitor_analysis"
-            elif state.intent == "email":     tool = "email_handler"
-            elif state.intent == "scraping":  tool = "tender_scraper"
-            else: tool = "general_response"
-            
-        return {
-            "type": "direct",
-            "tool": tool
-        }
+            if intent == "competitor":    tool = "competitor_analysis"
+            elif intent == "email":       tool = "email_handler"
+            elif intent == "scraping":    tool = "tender_scraper"
+            elif intent == "rfp":         tool = "rfp_aggregator"
+            else:                         tool = "general_response"
+        return {"type": "direct", "tool": tool}
 
     if mode == "workflow":
-        return {
-            "type": "workflow",
-            "workflow": state.workflow_type
-        }
+        workflow = state.workflow_type
+        if not workflow or workflow == "hybrid":
+            if intent == "rfp":           workflow = "rfp"
+            elif intent == "onboarding":  workflow = "onboarding"
+            else:                         workflow = "hybrid"
+        return {"type": "workflow", "workflow": workflow}
 
-    return {
-        "type": "direct",
-        "tool": "general_response"
-    }
-
+    return {"type": "direct", "tool": "general_response"}
 
 class ToolSelector:
     def __init__(self, input_data: PerceptionInput, state: ExecutionState):
@@ -742,7 +790,7 @@ class ToolSelector:
         # ── Per-tool deterministic mappings ──────────────────────────────────
 
         if tool_name == "rfp_aggregator":
-            return {"document": primary_doc, "text_path": ""}
+            return {"pdf_path": primary_doc}
 
         elif tool_name == "risk_compliance":
             # State Priority: Use processed rfp_aggregator output if available
@@ -817,34 +865,33 @@ class ToolSelector:
 
         elif tool_name == "vendor_procurement":
             # Determine mode based on action entity
-            mode = "list_only" if entities.get("action") == "list_vendors" else "full"
+            action_type = entities.get("action")
+            mode = "list_only" if action_type == "list_vendors" else "full"
             
-            if mode == "full":
-                # Must provide requirement for scoring/research
-                agg = results.get("rfp_aggregator", {})
-                if not agg:
-                    logger.warning("⚠️  Attempting full procurement without prior RFP aggregation results.")
-                    # Return error or triggger HIL if possible, here we provide fallback
-                    return {"mode": "full", "requirement": None, "error": "RFP data missing"}
+            # STATE INJECTION: Pull technical requirements from state for procurement follow-ups
+            agg = results.get("rfp_aggregator", {})
+            tech_reqs = agg.get("technical_requirements", []) or results.get("technical_agent", {}).get("requirements", [])
+
+            if mode == "full" or (mode == "list_only" and not entities.get("requirements")):
+                if not agg and not tech_reqs:
+                    logger.warning("⚠️  Procurement requested but no RFP/technical requirements found in state.")
+                    return {"mode": mode, "requirement": None}
                 
-                # Use same requirement builder logic
-                requirement = results.get("market_research", {}).get("requirement") # Try reusing if exists
-                if not requirement:
-                    # Manually construct as per build_requirement_obj logic above
-                    tech_reqs = agg.get("technical_requirements", [])
-                    requirement = {
-                        "requirement_id": agg.get("rfp_id", "REQ-001"),
-                        "description": agg.get("scope_of_work", agg.get("rfp_title", "Procurement request")),
-                        "deadline": datetime.now(), # Simplified for this chunk
-                        "priority": entities.get("priority", "balanced"),
-                        "pricing": {"budget": entities.get("budget", 100000)},
-                        "technical_specifications": {f"req_{i}": req for i, req in enumerate(tech_reqs)}
-                    }
-                return {"mode": "full", "requirement": requirement}
+                # Construct requirement from state memory if explicit parameters missing
+                requirement = {
+                    "requirement_id": agg.get("rfp_id", "REQ-FOLLOWUP"),
+                    "description": agg.get("scope_of_work", "Follow-up procurement request"),
+                    "deadline": datetime.now(),
+                    "priority": entities.get("priority", "balanced"),
+                    "pricing": {"budget": entities.get("budget", 100000)},
+                    "technical_specifications": {f"req_{i}": req for i, req in enumerate(tech_reqs)} if isinstance(tech_reqs, list) else {"desc": str(tech_reqs)}
+                }
+                return {"mode": mode, "requirement": requirement}
             
             return {"mode": mode}
 
         elif tool_name == "vendor_negotiation":
+            # STATE INJECTION: Resolve vendor/terms from prior procurement results
             vendor_name = entities.get("vendor_name", "")
             proc = results.get("vendor_procurement", {})
             candidates = proc.get("top_vendors", []) + proc.get("all_vendors", [])
@@ -895,7 +942,195 @@ class ToolSelector:
             return {"status": "error", "error": str(e)}
 
     # ========== CONVERSATIONAL / GENERAL RESPONSE ==========
+    def _get_vendor_list(self) -> List[Dict[str, Any]]:
+        """Return vendor list from state if available, else standard demo data."""
+        cached = self.state.results.get("vendor_list")
+        if cached:
+            return cached
+        return [
+            {"vendor_id": "v001", "name": "TechCorp Solutions",
+             "cost": 85000,  "technical_rating": 4.5, "avg_delivery_days": 15,
+             "financial_rating": 4.0, "compliant": True,  "transaction_count": 25,
+             "kyc_status": "verified", "risk_score": 0.15},
+            {"vendor_id": "v002", "name": "InnovateSoft Ltd",
+             "cost": 95000,  "technical_rating": 4.8, "avg_delivery_days": 12,
+             "financial_rating": 4.5, "compliant": True,  "transaction_count": 35,
+             "kyc_status": "verified", "risk_score": 0.10},
+            {"vendor_id": "v003", "name": "ValueFirst Services",
+             "cost": 65000,  "technical_rating": 3.4, "avg_delivery_days": 25,
+             "financial_rating": 3.2, "compliant": True,  "transaction_count": 8,
+             "kyc_status": "verified", "risk_score": 0.35},
+            {"vendor_id": "v004", "name": "Apex Cloud Systems",
+             "cost": 82000,  "technical_rating": 4.2, "avg_delivery_days": 18,
+             "financial_rating": 3.8, "compliant": True,  "transaction_count": 18,
+             "kyc_status": "verified", "risk_score": 0.20},
+            {"vendor_id": "v005", "name": "Nexus IT Providers",
+             "cost": 72000,  "technical_rating": 3.9, "avg_delivery_days": 22,
+             "financial_rating": 2.5, "compliant": False, "transaction_count": 5,
+             "kyc_status": "pending_compliance", "risk_score": 0.65},
+            {"vendor_id": "v006", "name": "Quantum Networks",
+             "cost": 60000,  "technical_rating": 4.0, "avg_delivery_days": 30,
+             "financial_rating": 2.0, "compliant": False, "transaction_count": 2,
+             "kyc_status": "failed", "risk_score": 0.90},
+            {"vendor_id": "v007", "name": "Horizon InfoTech",
+             "cost": 120000, "technical_rating": 4.9, "avg_delivery_days": 8,
+             "financial_rating": 4.8, "compliant": False, "transaction_count": 42,
+             "kyc_status": "failed", "risk_score": 0.85},
+        ]
 
+    def _execute_procurement_functions(self, action: str) -> Dict[str, Any]:
+        """
+        Execute ONLY the functions required for this procurement action.
+        Reads from and writes back to self.state.results["procurement_state"]
+        so follow-up queries (negotiate, finalize) have access to prior results.
+        """
+        functions = PROCUREMENT_FUNCTION_FLOW.get(action)
+        if not functions:
+            logger.warning(f"⚠️  Unknown procurement action '{action}' — falling back to general response")
+            return {
+                "status": "error",
+                "error": f"Unknown procurement action: {action}"
+            }
+
+        logger.info(f"⚙️  PROCUREMENT EXECUTOR: '{action}' → {functions}")
+
+        # ── Build or restore procurement state ───────────────────────────────────
+        proc_state: Dict[str, Any] = self.state.results.get("procurement_state") or {}
+
+        if not proc_state:
+            agg = self.state.results.get("rfp_aggregator", {})
+
+            # Safe deadline conversion
+            raw_deadline = agg.get("deadline", "")
+            try:
+                if str(raw_deadline).replace(".", "", 1).isdigit():
+                    deadline_dt = datetime.fromtimestamp(float(raw_deadline))
+                elif raw_deadline:
+                    deadline_dt = datetime.fromisoformat(str(raw_deadline))
+                else:
+                    deadline_dt = datetime.now()
+            except Exception:
+                deadline_dt = datetime.now()
+
+            tech_reqs = agg.get("technical_requirements", [])
+            tech_spec = (
+                {f"req_{i}": r for i, r in enumerate(tech_reqs)}
+                if isinstance(tech_reqs, list) else {"desc": str(tech_reqs)}
+            )
+
+            proc_state = {
+                "requirement": {
+                    "requirement_id": agg.get("rfp_id", "REQ-001"),
+                    "description":    agg.get("scope_of_work", "General procurement requirement"),
+                    "deadline":       deadline_dt,
+                    "priority":       self.state.entities.get("priority", "balanced"),
+                    "pricing":        {"budget": self.state.entities.get("budget", 150000), "currency": "INR"},
+                    "technical_specifications": tech_spec,
+                },
+                "vendors":             self._get_vendor_list(),
+                "market_insights":     "",
+                "normalized_vendors":  [],
+                "scored_vendors":      [],
+                "top_vendors":         [],
+                "negotiation_history": [],
+                "user_action":         None,
+                "final_vendor":        None,
+                "decision":            {},
+            }
+
+        # ── Pre-flight guards ─────────────────────────────────────────────────────
+        if action == "negotiate":
+            if not proc_state.get("top_vendors"):
+                return {
+                    "status": "error",
+                    "error": "No shortlisted vendors to negotiate with. Run 'give me vendors' first."
+                }
+
+        # Resolve vendor_id from entities (by name if needed)
+        vendor_name = self.state.entities.get("vendor_name", "")
+        vendor_id   = self.state.entities.get("vendor_id", "")
+        if not vendor_id and vendor_name:
+            for v in proc_state["top_vendors"]:
+                if vendor_name.lower() in v.get("name", "").lower():
+                    vendor_id = v["vendor_id"]
+                    break
+        if not vendor_id and proc_state["top_vendors"]:
+            vendor_id = proc_state["top_vendors"][0]["vendor_id"]  # default to top vendor
+
+        proc_state["user_action"] = {
+            "vendor_id":           vendor_id,
+            "negotiation_intent":  self.state.entities.get("negotiation_intent", "reduce_cost"),
+            "target_value":        self.state.entities.get("target_value"),
+        }
+        logger.info(f"   └─ Negotiating with vendor_id={vendor_id}, intent={proc_state['user_action']['negotiation_intent']}")
+
+        if action == "finalize":
+            if not proc_state.get("top_vendors"):
+                return {
+                    "status": "error",
+                    "error": "No vendors available for finalization. Run procurement pipeline first."
+                }
+
+        # ── Function map ──────────────────────────────────────────────────────────
+        FUNC_MAP = {
+            "market_research":          market_research,
+            "normalize_vendors":        normalize_vendors,
+            "scoring_engine":           scoring_engine,
+            "select_top_vendors":       select_top_vendors,
+            "negotiation_simulation":   negotiation_simulation,
+            "rescore_after_negotiation": rescore_after_negotiation,
+            "decision_engine":          decision_engine,
+            "purchase_order_generation": purchase_order_generation,
+        }
+
+        # ── Execute chain ─────────────────────────────────────────────────────────
+        for func_name in functions:
+            func = FUNC_MAP.get(func_name)
+            if not func:
+                logger.warning(f"   ⚠️  Function '{func_name}' not found in map — skipping")
+                continue
+            logger.info(f"   ▶️  {func_name}")
+            try:
+                if func_name == "negotiation_simulation":
+                    proc_state = func(proc_state, proc_state.get("user_action", {}))
+                else:
+                    proc_state = func(proc_state)
+            except Exception as e:
+                logger.error(f"❌ {func_name} failed: {e}")
+        logger.info(f"✓ Procurement '{action}' complete — {len(proc_state.get('top_vendors', []))} top vendors in state")
+
+        # ── Final Count Enforcement & Result Shaping ─────────────────────────────
+        top_vendors = proc_state.get("top_vendors", [])[:3]
+        proc_state["top_vendors"] = top_vendors
+        
+        # ── Persist updated state for follow-up queries ───────────────────────────
+        self.state.results["procurement_state"] = proc_state
+        self.state.results["vendor_procurement"] = {
+            "top_vendors": top_vendors,
+            "all_vendors": proc_state.get("scored_vendors", []),
+            "recommended": top_vendors[0] if top_vendors else None,
+        }
+
+        logger.info(f"✓ Procurement '{action}' complete — {len(top_vendors)} top vendors in state")
+
+        # Pull latest negotiation for UI highlighting
+        active_neg = proc_state.get("negotiation_history", [])[-1] if action == "negotiate" and proc_state.get("negotiation_history") else None
+
+        return {
+            "status": "success",
+            "data": {
+                "action":               action,
+                "last_action":          action,
+                "is_follow_up":         action != "list_vendors" and action != "full_procurement",
+                "functions_executed":   functions,
+                "top_vendors":          top_vendors,
+                "active_negotiation":   active_neg,
+                "market_insights":      proc_state.get("market_insights", ""),
+                "negotiation_history":  proc_state.get("negotiation_history", []),
+                "decision":             proc_state.get("decision", {}),
+                "purchase_order":       proc_state.get("decision", {}).get("purchase_order"),
+            }
+        }
     def _run_general_response(self, task: Task = None, **kwargs) -> Dict:
         task = task or kwargs.get("task")
         try:
@@ -992,11 +1227,19 @@ GUIDELINES:
 
     def _run_rfp_aggregator(self, task: Task = None, **kwargs) -> Dict:
         task     = task or kwargs.get("task")
-        document = kwargs.get("document")
+        # Tool Input Fix: support both 'document' (legacy) and 'pdf_path' (new standard)
+        document = kwargs.get("pdf_path") or kwargs.get("document")
         try:
-            path = document or self.input_data.rfp_pdf_path
+            path = document or self.state.input_data.get("file_path")
             if not path:
                 return {"status": "error", "error": "No RFP document path resolved"}
+
+            path=path.lstrip('/')
+            logger.info(f"Using file path: {path}")
+            logger.info(f"Exists: {os.path.exists(path)}")
+            
+            if not os.path.exists(path):
+                raise Exception(f"File not found: {path}")
 
             logger.info(f"📄 Loading RFP from: {path}")
 
@@ -2195,10 +2438,20 @@ def orchestrate(prompt_input: PromptInput) -> OrchestrationOutput:
         perception = perception_layer(prompt_input)
 
         # Initialize State
+        intent = perception.intent
+        workflow = perception.workflow
+        
+        # ── DETERMINISTIC WORKFLOW FALLBACK ──
+        if not workflow or workflow in ["hybrid", "unknown"]:
+            if intent == "rfp":          workflow = "rfp"
+            elif intent == "procurement": workflow = "procurement"
+            elif intent == "onboarding":  workflow = "onboarding"
+            elif intent == "competitor":  workflow = "competitor_analysis"
+
         state = ExecutionState(
             workflow_id=workflow_id,
-            workflow_type=perception.workflow,
-            intent=perception.intent,
+            workflow_type=workflow,
+            intent=intent,
             mode=perception.mode,
             entities=perception.entities,
             input_data={"prompt": prompt_input.prompt, "file_path": prompt_input.file_path, "url": prompt_input.url},
@@ -2223,7 +2476,26 @@ def orchestrate(prompt_input: PromptInput) -> OrchestrationOutput:
             if tool_name == "general_response":
                 reply = selector._run_general_response(Task(id="t1", task_name="Direct Response", description="General", required_inputs={"original_goal": prompt_input.prompt, "history": _prior_ctx.get("history", [])}))
                 return OrchestrationOutput(status="success", workflow_id=workflow_id, workflow_type="conversational", tasks_executed=["t1"], results={"reply": reply}, total_execution_time=0.1)
-
+            if tool_name == "procurement_functions":
+                action = route.get("action", "list_vendors")
+                logger.info(f"💼 PROCUREMENT DIRECT: action='{action}'")
+                result = selector._execute_procurement_functions(action)
+                
+                # Merge task-specific data into state results for UI
+                if result.get("status") == "success":
+                    state.results["procurement_result"] = result.get("data", {})
+                
+                return OrchestrationOutput(
+                    status=result.get("status", "success"),
+                    workflow_id=workflow_id,
+                    workflow_type="procurement",
+                    intent=intent,
+                    tasks_executed=[action],
+                    results=state.results,
+                    context_memory={"procurement_state": state.results.get("procurement_state", {})},
+                    errors={"procurement": result["error"]} if result.get("status") == "error" else {},
+                    total_execution_time=0.5
+                )
             # Standard Tool Execution
             task = Task(id="t1", task_name=route["tool"], tool_name=tool_name, description=f"Direct action: {tool_name}")
             result = selector.select_and_execute(task)
