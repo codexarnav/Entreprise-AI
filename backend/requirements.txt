@@ -19,3 +19,6 @@ gunicorn
 motor
 jose
 passlib
+pytesseract
+mediapipe
+cv2
