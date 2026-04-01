@@ -21,4 +21,4 @@ jose
 passlib
 pytesseract
 mediapipe
-cv2
+
