@@ -17,3 +17,5 @@ python-jose[cryptography]
 curl-cffi
 gunicorn
 motor
+jose
+passlib
