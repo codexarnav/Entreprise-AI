@@ -15,3 +15,5 @@ google-generativeai
 chromadb
 python-jose[cryptography]
 curl-cffi
+gunicorn
+motor
