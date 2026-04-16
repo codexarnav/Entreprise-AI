@@ -23,3 +23,7 @@ pytesseract
 mediapipe
 python-multipart
 apify-client
+opencv-python
+numpy
+beautifulsoup4
+PyPDF2
