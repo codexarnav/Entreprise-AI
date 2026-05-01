@@ -29,4 +29,5 @@ numpy
 beautifulsoup4
 PyPDF2
 bcrypt
+certifi
 
