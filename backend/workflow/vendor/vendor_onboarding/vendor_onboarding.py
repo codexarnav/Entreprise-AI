@@ -3,7 +3,7 @@ import json
 import numpy as np
 import cv2
 import pytesseract
-from mediapipe import solutions as mp
+import mediapipe as mp
 
 from typing import Dict, Any, List
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -104,7 +104,7 @@ def extract_face_from_image(image_path: str):
             
         rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         
-        face_detection = mp.face_detection.FaceDetection()
+        face_detection = mp.solutions.face_detection.FaceDetection()
         result = face_detection.process(rgb_img)
         
         if result.detections:
