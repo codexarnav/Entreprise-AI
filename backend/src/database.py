@@ -1,7 +1,7 @@
 import os
 import logging
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
-
+import certifi
 logger = logging.getLogger(__name__)
 
 MONGO_URI = os.getenv("MONGO_URI") 
@@ -12,7 +12,7 @@ _client: AsyncIOMotorClient = None
 
 async def connect_db() -> None:
     global _client
-    _client = AsyncIOMotorClient(MONGO_URI)
+    _client = AsyncIOMotorClient(MONGO_URI, tlsCAFile=certifi.where())
     await _client.admin.command("ping")
     logger.info(f"✓ MongoDB connected → {DB_NAME}")
 
