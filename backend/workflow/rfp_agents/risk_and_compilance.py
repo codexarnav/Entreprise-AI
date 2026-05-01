@@ -1,7 +1,7 @@
 import os
 import json
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langgraph.graph import StateGraph, START, END
 from typing import TypedDict, List, Optional, Dict
 from pydantic import BaseModel
