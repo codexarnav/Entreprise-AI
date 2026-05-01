@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field, validator
 from langgraph.graph import StateGraph, START, END
 from langchain_google_genai import ChatGoogleGenerativeAI
 from apify_client import ApifyClient
-from langchain.text_splitters import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 logging.basicConfig(
     level=logging.INFO,
