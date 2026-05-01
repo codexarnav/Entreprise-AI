@@ -28,3 +28,5 @@ opencv-python
 numpy
 beautifulsoup4
 PyPDF2
+bcrypt
+
